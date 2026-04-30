@@ -6,12 +6,19 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_SETAFFINITY;
+use crate::arch::CurrentIrqArch;
+use crate::exception::InterruptArch;
 use crate::libs::cpumask::CpuMask;
 use crate::process::{ProcessManager, RawPid};
+use crate::sched::load_balance::LoadBalancer;
+use crate::sched::send_resched_ipi;
 use crate::sched::syscall::util::has_sched_setaffinity_permission;
-use crate::sched::{schedule, SchedMode};
+use crate::sched::{
+    cpu_rq, schedule, task_cpu, ttwu_queue, DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags,
+    __set_task_cpu,
+};
+use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::smp_cpu_manager;
-use crate::smp::smp_get_processor_id;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 
@@ -58,17 +65,91 @@ impl Syscall for SysSchedSetaffinity {
             }
         }
 
-        // 已知限制：schedule() 仅让出 CPU，并不会将当前任务从本地 rq 迁移。
-        // Linux 使用 stop_one_cpu_nowait + migration_cpu_stop 物理移动任务。
-        // 当前实现仅标记迁移需求，依赖后续负载均衡完成实际迁移。
-        // 完整修复需要实现 CPU stopper 机制。
+        // 设置新 mask 后，判断是否需要物理迁移。
+        target_pcb.sched_info().set_cpus_allowed(mask.clone());
+
+        let task_cpu_id = task_cpu(&target_pcb);
+        let needs_migration = mask.get(task_cpu_id) != Some(true);
+        if !needs_migration {
+            return Ok(0);
+        }
+
+        // 选择目标 CPU
+        let dest_cpu =
+            LoadBalancer::select_task_rq(&target_pcb, task_cpu_id, WakeupFlags::WF_TTWU.bits());
+        let dest_cpu = if dest_cpu == crate::smp::cpu::ProcessorId::INVALID {
+            mask.first().unwrap_or(task_cpu_id)
+        } else {
+            dest_cpu
+        };
+
         let is_current = Arc::ptr_eq(&target_pcb, &ProcessManager::current_pcb());
-        let cur_cpu_excluded = is_current && mask.get(smp_get_processor_id()) != Some(true);
 
-        target_pcb.sched_info().set_cpus_allowed(mask);
+        if is_current {
+            // 当前任务从自身 rq 出队，迁移到目标 CPU，schedule 让出 CPU。
+            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            let cur_cpu = smp_get_processor_id();
+            let rq = cpu_rq(cur_cpu.data() as usize);
+            let (rq_ref, guard) = rq.self_lock();
+            rq_ref.update_rq_clock();
 
-        if cur_cpu_excluded {
+            *target_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Migrating;
+            rq_ref.dequeue_task(
+                target_pcb.clone(),
+                DequeueFlag::DEQUEUE_SAVE | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            __set_task_cpu(&target_pcb, dest_cpu);
+            drop(guard);
+
+            if dest_cpu != cur_cpu {
+                ttwu_queue(&target_pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+            }
+
             schedule(SchedMode::SM_NONE);
+            drop(_irq_guard);
+        } else {
+            // 非当前任务迁移
+            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+            let on_rq = *target_pcb.sched_info().on_rq.lock_irqsave();
+            let on_cpu = target_pcb.sched_info().on_cpu();
+
+            if on_rq == OnRq::Queued && on_cpu.is_none() {
+                // 任务在 rq 上排队且未运行，直接出队 → set_task_cpu → 锁目标 rq → 入队。
+                let src_rq = cpu_rq(task_cpu_id.data() as usize);
+                let (src_ref, src_guard) = src_rq.self_lock();
+                src_ref.update_rq_clock();
+
+                *target_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Migrating;
+                src_ref.dequeue_task(
+                    target_pcb.clone(),
+                    DequeueFlag::DEQUEUE_SAVE | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
+                __set_task_cpu(&target_pcb, dest_cpu);
+                drop(src_guard);
+
+                // 锁目标 rq 并 activate
+                let dst_rq = cpu_rq(dest_cpu.data() as usize);
+                let (dst_ref, dst_guard) = dst_rq.self_lock();
+                dst_ref.update_rq_clock();
+                dst_ref.activate_task(
+                    &target_pcb,
+                    EnqueueFlag::ENQUEUE_WAKEUP
+                        | EnqueueFlag::ENQUEUE_NOCLOCK
+                        | EnqueueFlag::ENQUEUE_MIGRATED,
+                );
+                dst_ref.check_preempt_currnet(&target_pcb, WakeupFlags::WF_MIGRATED);
+                drop(dst_guard);
+            } else if on_cpu.is_some() {
+                // 任务正在运行（在另一个 CPU 上）。
+                // DragonOS 无 stop_one_cpu_nowait，发送 resched IPI 让目标 CPU
+                // 在下一次 schedule 时检查 cpus_allowed 并触发迁移。
+                send_resched_ipi(on_cpu.unwrap());
+            }
+            // else: 任务已阻塞（on_rq==None, on_cpu==None），
+            // ttwu_do_activate 在唤醒时会通过 select_task_rq 选择允许的 CPU。
+
+            drop(_irq_guard);
         }
 
         Ok(0)

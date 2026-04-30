@@ -371,20 +371,40 @@ impl ProcessManager {
                 writer.set_wakeup();
                 drop(writer);
 
-                // 若 task 已在 rq 上排队，仅做 check_preempt_curr + 标记 RUNNING，
-                // 不调用 set_task_cpu / activate_task，避免在 rbtree 内破坏 cfs_rq 指针。
-                let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
-                if on_rq == OnRq::Queued {
-                    // ttwu_runnable: task 已在 rq 上，无需迁移或重新入队
-                    let prev_cpu = task_cpu(pcb);
-                    let rq = cpu_rq(prev_cpu.data() as usize);
-                    let (rq, _rq_guard) = rq.self_lock();
-                    rq.update_rq_clock();
-                    rq.check_preempt_currnet(pcb, WakeupFlags::WF_TTWU);
-                } else if let Some(cpu_id) = pcb.sched_info().on_cpu() {
-                    // task 正在运行（on_cpu 不为 None），说明它正在某个 CPU 的 __schedule 中。
-                    // 将 wakeup 放入该 CPU 的 WakeQueue，由该 CPU 在 switch_finish_hook
-                    // 后处理，避免在 dequeue 窗口内并发 set_task_cpu 导致 cfs_rq 不匹配。
+                // 防止 CPU 将 on_rq 的加载重排到 state 写入之前。
+                core::sync::atomic::fence(Ordering::SeqCst);
+
+                // retry 循环。
+                let mut rq_to_lock = task_cpu(pcb);
+                let _on_rq = loop {
+                    let rq_arc = cpu_rq(rq_to_lock.data() as usize);
+                    let (rq_ref, guard) = rq_arc.self_lock();
+                    let current_cpu = task_cpu(pcb);
+                    if current_cpu != rq_to_lock
+                        || *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating
+                    {
+                        drop(guard);
+                        rq_to_lock = current_cpu;
+                        continue;
+                    }
+                    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+                    if on_rq == OnRq::Queued {
+                        rq_ref.update_rq_clock();
+                        rq_ref.check_preempt_currnet(pcb, WakeupFlags::WF_TTWU);
+                        drop(guard);
+                        return Ok(());
+                    }
+                    drop(guard);
+                    break on_rq;
+                };
+
+                let prev_cpu = task_cpu(pcb);
+
+                // rq lock 释放后、读取 on_cpu 之前插入 acquire fence，
+                // 防止 CPU 将 on_cpu 的加载重排到 on_rq 的加载之前。
+                core::sync::atomic::fence(Ordering::Acquire);
+
+                if let Some(cpu_id) = pcb.sched_info().on_cpu() {
                     log::trace!(
                         "wakeup: pid={:?} on_cpu={:?}, queue to wakelist",
                         pcb.raw_pid(),
@@ -394,7 +414,6 @@ impl ProcessManager {
                     wq.push(pcb.clone());
                     crate::sched::send_resched_ipi(cpu_id);
                 } else {
-                    let prev_cpu = task_cpu(pcb);
                     Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU);
                 }
                 return Ok(());
@@ -752,6 +771,11 @@ impl ProcessManager {
             let pcb = ProcessManager::current_pcb();
             pcb.mark_exiting();
             pid = pcb.pid();
+
+            // 递减线程组存活计数。返回值 group_dead 表示当前是否是最后一个线程。
+            // TODO: 当前未使用 group_dead，但 future seccomp/cgroup 需要此计数器。
+            // let _group_dead: bool = pcb.sighand().live.fetch_sub(1, Ordering::SeqCst) == 1;
+
             pcb.wait_queue.mark_dead();
 
             // 进行进程退出后的工作
@@ -985,9 +1009,12 @@ impl ProcessManager {
             .expect("next_pcb is None");
 
         // finish_task(prev): smp_store_release(&prev->on_cpu, 0)
-        // 必须在硬件上下文切换完成后执行，否则 ttwu 可能观察到 on_cpu==None
-        // 并在 prev 仍在执行时尝试在其他 CPU 上唤醒它。
         prev_pcb.sched_info().set_on_cpu(None);
+
+        // 清除 in_switch 标志
+        // 必须在 on_cpu 清除之后：远程 CPU 看到 in_switch=false 后可以安全 activate。
+        let cpu = crate::smp::core::smp_get_processor_id();
+        crate::sched::cpu_rq(cpu.data() as usize).set_in_switch(false);
 
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
         fence(Ordering::SeqCst);
@@ -2614,7 +2641,7 @@ impl ProcessSchedulerInfo {
         if let Some(cpu_id) = on_cpu {
             self.on_cpu.store(cpu_id, Ordering::SeqCst);
         } else {
-            self.on_cpu.store(ProcessorId::INVALID, Ordering::SeqCst);
+            self.on_cpu.store(ProcessorId::INVALID, Ordering::Release);
         }
     }
 

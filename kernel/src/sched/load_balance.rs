@@ -70,8 +70,8 @@ impl LoadBalancer {
     /// 选择任务唤醒时的目标CPU
     ///
     /// 这个函数在任务被唤醒时调用，用于选择最适合运行该任务的CPU。
-    /// 目前仅处理 cpus_allowed 掩码、WF_CURRENT_CPU 和粗略负载比较，
-    /// 未实现 Linux 的 wake_affine、LLC 域扫描及 sched_domain 层级逻辑。
+    /// 目前处理 cpus_allowed 掩码、WF_CURRENT_CPU、粗略负载比较以及 wake_affine，
+    /// 尚未实现 LLC 域扫描及 sched_domain 层级逻辑。
     pub fn select_task_rq(
         pcb: &Arc<ProcessControlBlock>,
         prev_cpu: ProcessorId,
@@ -493,7 +493,8 @@ pub fn find_busiest_queue(env: &LbEnv, group: &SchedGroup) -> Option<ProcessorId
     let mut busiest_nr = 0u32;
     let mut busiest_capacity = 1u64;
 
-    for cpu in group.cpumask.iter_cpu() {
+    let candidates = &group.cpumask & &env.cpus;
+    for cpu in candidates.iter_cpu() {
         if cpu == env.dst_cpu {
             continue;
         }
@@ -564,7 +565,8 @@ fn can_migrate_task(pcb: &Arc<ProcessControlBlock>, env: &mut LbEnv) -> bool {
             let sd = env.sd.as_ref();
             if let Some(sd) = sd {
                 if let Some(ref group) = sd.groups {
-                    for cpu in group.cpumask.iter_cpu() {
+                    let candidates = &group.cpumask & &env.cpus;
+                    for cpu in candidates.iter_cpu() {
                         if info.cpus_allowed().get(cpu).unwrap_or(false) {
                             env.flags |= LbfFlags::DST_PINNED;
                             env.new_dst_cpu = cpu;
@@ -578,7 +580,7 @@ fn can_migrate_task(pcb: &Arc<ProcessControlBlock>, env: &mut LbEnv) -> bool {
         return false;
     }
 
-    env.flags &= !LbfFlags::ALL_PINNED;
+    env.flags.remove(LbfFlags::ALL_PINNED);
 
     if info.on_cpu() == Some(env.src_cpu) {
         return false;
@@ -622,7 +624,7 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
     let cfs_rq = unsafe { cfs_rq_arc.force_mut() };
 
     if src_rq.nr_running_lockless() <= 1 {
-        env.flags &= !LbfFlags::ALL_PINNED;
+        env.flags.remove(LbfFlags::ALL_PINNED);
         return 0;
     }
 
@@ -776,7 +778,8 @@ pub fn load_balance(
     let group = match find_busiest_group(&mut env) {
         Some(g) => g,
         None => {
-            // out_balanced: 没找到不平衡的 group，倍增 balance_interval 退避（跳过 NEWLY_IDLE）。
+            // out_balanced → out_all_pinned: nr_balance_failed = 0。
+            sd.nr_balance_failed.store(0, Ordering::Relaxed);
             if idle != super::rebalance::CpuIdleType::NewlyIdle {
                 let cur = sd.balance_interval.load(Ordering::Relaxed);
                 if cur < sd.max_interval {
@@ -790,7 +793,8 @@ pub fn load_balance(
     let busiest_cpu = match find_busiest_queue(&env, &group) {
         Some(cpu) => cpu,
         None => {
-            // out_balanced: 找到 group 但没有 busiest queue
+            // out_balanced → out_all_pinned: Linux 两标签都执行 nr_balance_failed = 0。
+            sd.nr_balance_failed.store(0, Ordering::Relaxed);
             if idle != super::rebalance::CpuIdleType::NewlyIdle {
                 let cur = sd.balance_interval.load(Ordering::Relaxed);
                 if cur < sd.max_interval {
@@ -810,6 +814,9 @@ pub fn load_balance(
     env.flags |= LbfFlags::ALL_PINNED;
 
     let mut ld_moved: u32 = 0;
+    // DST_PINNED 重试上限：每次重试清除一个不可用的 dst_cpu，最多等于组内 CPU 数。
+    let dst_pinned_limit = group.cpumask.iter_cpu().count();
+    let mut dst_pinned_retries = 0;
 
     loop {
         let (first_cpu, second_cpu) = if env.dst_cpu < busiest_cpu {
@@ -862,13 +869,18 @@ pub fn load_balance(
         // LBF_NEED_BREAK: DragonOS 缺少 TASK_ON_RQ_MIGRATING 保护，
         // 释放锁后重新获取会导致 TOCTOU 竞态。不再重试。
         if env.flags.contains(LbfFlags::NEED_BREAK) {
-            env.flags -= LbfFlags::NEED_BREAK;
+            env.flags.remove(LbfFlags::NEED_BREAK);
         }
 
-        // LBF_DST_PINNED: 更换 dst_cpu 后重试
+        // LBF_DST_PINNED: 更换 dst_cpu 后重试（上限为组内 CPU 数）
         if env.flags.contains(LbfFlags::DST_PINNED) && env.imbalance > 0 {
+            dst_pinned_retries += 1;
+            if dst_pinned_retries >= dst_pinned_limit {
+                break;
+            }
+            env.cpus.set(env.dst_cpu, false);
             env.dst_cpu = env.new_dst_cpu;
-            env.flags -= LbfFlags::DST_PINNED;
+            env.flags.remove(LbfFlags::DST_PINNED);
             env.loop_ctr = 0;
             env.loop_break = SCHED_NR_MIGRATE_BREAK;
             continue;
@@ -877,35 +889,32 @@ pub fn load_balance(
         break;
     }
 
+    // 对齐 Linux fair.c load_balance 尾部逻辑:
+    //   ld_moved > 0            → nr_balance_failed = 0, balance_interval = min_interval
+    //   ALL_PINNED (out_all_pinned) → nr_balance_failed = 0, balance_interval *= 2
+    //   NewlyIdle               → 不更新 balance_interval
+    //   普通失败                → nr_balance_failed++, balance_interval = min_interval
     if ld_moved > 0 {
         sd.nr_balance_failed.store(0, Ordering::Relaxed);
         sd.balance_interval
             .store(sd.min_interval.load(Ordering::Relaxed), Ordering::Relaxed);
+    } else if env.flags.contains(LbfFlags::ALL_PINNED) {
+        // Linux: out_all_pinned → nr_balance_failed = 0; ld_moved = 0;
+        // out_one_pinned → if NewlyIdle goto out; else balance_interval *= 2
+        sd.nr_balance_failed.store(0, Ordering::Relaxed);
+        if env.idle != super::rebalance::CpuIdleType::NewlyIdle {
+            let max_pinned = 512u64;
+            let cur = sd.balance_interval.load(Ordering::Relaxed);
+            if cur < max_pinned {
+                sd.balance_interval.store(cur * 2, Ordering::Relaxed);
+            }
+        }
     } else {
         if env.idle != super::rebalance::CpuIdleType::NewlyIdle {
             sd.nr_balance_failed.fetch_add(1, Ordering::Relaxed);
         }
-
-        // 发现不平衡但迁移失败时 reset to min_interval
-        // 倍增仅在 "balanced / all_pinned / one_pinned" 路径中执行。
         sd.balance_interval
             .store(sd.min_interval.load(Ordering::Relaxed), Ordering::Relaxed);
-    }
-
-    // out_balanced / out_all_pinned / out_one_pinned 路径:
-    // 当没有找到 busiest (find_busiest_group → None) 或所有任务被 pin 时，
-    // 通过倍增 balance_interval 退避。
-    // DragonOS 的 find_busiest_group → None 直接 return false（不经过此处），
-    // 因此这里的 ALL_PINNED 检查覆盖 "找到 busiest 但全部被 pin" 的情况。
-    if ld_moved == 0
-        && env.flags.contains(LbfFlags::ALL_PINNED)
-        && env.idle != super::rebalance::CpuIdleType::NewlyIdle
-    {
-        let max_pinned = 512u64; // MAX_PINNED_INTERVAL — 对齐 Linux fair.c:10916
-        let cur = sd.balance_interval.load(Ordering::Relaxed);
-        if cur < max_pinned {
-            sd.balance_interval.store(cur * 2, Ordering::Relaxed);
-        }
     }
 
     ld_moved > 0

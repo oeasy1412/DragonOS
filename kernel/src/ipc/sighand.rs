@@ -35,6 +35,8 @@ pub struct SigHand {
     /// 避免遍历 fd_table（涉及 RwLock/RwSem，在 hardirq 中不安全）。
     /// 使用 irqsave SpinLock，hardirq 安全。
     signalfd_epitems: LockedEPItemLinkedList,
+    // TODO: 线程组中存活线程的原子计数。
+    // pub live: AtomicUsize,
 }
 
 impl Debug for SigHand {
@@ -67,6 +69,7 @@ impl SigHand {
             group_exec_wait_queue: WaitQueue::default(),
             signalfd_wqh: WaitQueue::default(),
             signalfd_epitems: LockedEPItemLinkedList::default(),
+            // live: AtomicUsize::new(1),
         })
     }
 

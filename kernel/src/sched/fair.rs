@@ -1220,7 +1220,7 @@ impl CfsRunQueue {
                     for entity in collateral {
                         self.entities.insert(entity.vruntime, entity);
                     }
-                    log::warn!(
+                    log::error!(
                         "inner_dequeue_entity: target se not found in rbtree (vruntime={})",
                         key
                     );
@@ -1444,6 +1444,8 @@ impl CompletelyFairScheduler {
     /// 且其 cfs_rq 应指向同一个 rq 的 cfs_rq。若 cfs_rq 不匹配，说明
     /// task 的 cfs_rq 指针被错误设置到另一个 CPU 的 rq 上，属于不变量违反。
     fn find_matching_se(se: &mut Arc<FairSchedEntity>, pse: &mut Arc<FairSchedEntity>) {
+        let orig_se = se.clone();
+        let orig_pse = pse.clone();
         let mut se_depth = se.depth;
         let mut pse_depth = pse.depth;
 
@@ -1458,9 +1460,6 @@ impl CompletelyFairScheduler {
         }
 
         while !Arc::ptr_eq(&se.cfs_rq(), &pse.cfs_rq()) {
-            // 无组调度时 parent() 为 None，cfs_rq 不匹配属于不变量违反。
-            // Linux 同样假设 cfs_rq 最终匹配（无 guard），
-            // 但 Linux 必然有组调度才会进入此循环。DragonOS 暂未实现组调度，因此安全返回。
             let se_parent = se.parent();
             let pse_parent = pse.parent();
             match (se_parent, pse_parent) {
@@ -1469,16 +1468,11 @@ impl CompletelyFairScheduler {
                     *pse = pp;
                 }
                 _ => {
-                    log::warn!(
-                        "find_matching_se: cfs_rq mismatch but no parent — \
-                         se depth={} pse depth={} se_rq_cpu={:?} pse_rq_cpu={:?}. \
-                         Skipping walk to prevent infinite loop.",
-                        se.depth,
-                        pse.depth,
-                        se.cfs_rq().rq().cpu(),
-                        pse.cfs_rq().rq().cpu(),
-                    );
-                    break;
+                    // 无组调度时 parent() 为 None，cfs_rq 不匹配。
+                    // 回退到原始叶实体，避免在错误的 cfs_rq 上做抢占判断。
+                    *se = orig_se;
+                    *pse = orig_pse;
+                    return;
                 }
             }
         }

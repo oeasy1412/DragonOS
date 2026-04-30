@@ -371,6 +371,8 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
             new_pcb.replace_sighand(current_pcb.sighand());
+            // TODO: CLONE_SIGHAND 意味着新线程共享 sighand（即同一线程组），递增 live 计数。
+            // current_pcb.sighand().live.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             return Ok(());
         }
 

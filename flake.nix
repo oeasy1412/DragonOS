@@ -109,11 +109,15 @@
 
           testOpt = {
             # 自动测试项目，指定内核启动环境变量参数 AUTO_TEST
-            autotest = "none";
+            autotest = "none"; # syscall / dunit
             syscall = {
               enable = true;
               testDir = "/opt/gvisor";
               version = "20251218";
+            };
+            dunitest = {
+              enable = true;
+              testDir = "/opt/tests/dunitest";
             };
           };
 

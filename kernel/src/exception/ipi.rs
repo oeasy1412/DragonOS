@@ -70,10 +70,9 @@ impl IrqHandler for KickCpuIpiHandler {
         let cpu = smp_get_processor_id();
         let rq = cpu_rq(cpu.data() as usize);
 
-        // scheduler_ipi() + sched_ttwu_pending()：
-        // IPI handler 中仅 try_lock，若 rq 锁被持有（如 load_balance 的 double_rq_lock）
-        // 则跳过，任务留在 WakeQueue 中，由下一次 scheduler_tick 或 __schedule 排空。
-        // Linux 的 scheduler_ipi() 完全不操作 rq 锁，实际唤醒延迟到 softirq / schedule 路径。
+        // 始终 rq_lock_irqsave 排空 wakelist。
+        // 若 try_lock 失败，任务留在 WakeQueue 中，由 scheduler_tick 或 __schedule 的
+        // switch_finish_hook 在下一次 rq lock 获取时排空。
         if let Some((rq, _guard)) = rq.try_self_lock() {
             rq.update_rq_clock();
             rq.drain_wake_queue();

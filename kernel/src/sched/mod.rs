@@ -18,7 +18,9 @@ pub mod topology;
 use core::{
     intrinsics::{likely, unlikely},
     panic::Location,
-    sync::atomic::{compiler_fence, fence, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{
+        compiler_fence, fence, AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering,
+    },
 };
 
 use alloc::{
@@ -370,13 +372,15 @@ pub struct CpuRunQueue {
 
     /// 下一次负载均衡时间（jiffies）。
     /// 使用 AtomicU64 以便在 trigger_load_balance（rq 锁内）和 rebalance_domains（无 rq 锁）中无锁写入。
-    pub(crate) next_balance: core::sync::atomic::AtomicU64,
+    pub(crate) next_balance: AtomicU64,
 
     /// 运行任务数
     nr_running: AtomicUsize,
 
     /// 被阻塞的任务数量
-    nr_uninterruptible: usize,
+    /// 单个 CPU 的计数器可以下溢为负数，但全局总和始终正确。
+    /// 允许跨 CPU 迁移时正确累减，避免 `saturating_sub` 导致的 loadavg 膨胀。
+    nr_uninterruptible: AtomicIsize,
 
     /// 因 IO 阻塞而睡眠的任务数量（用于区分 iowait）
     nr_iowait: AtomicUsize,
@@ -429,12 +433,25 @@ pub struct CpuRunQueue {
 
     /// 该 CPU 的 sched_domain 层级（单层模型下只有一个）
     sched_domain: Option<Arc<SchedDomain>>,
+
+    /// 上下文切换进行中标志。
+    in_switch: AtomicBool,
 }
 
 impl CpuRunQueue {
     #[inline]
     pub fn cpu(&self) -> ProcessorId {
         self.cpu
+    }
+
+    #[inline]
+    pub fn set_in_switch(&self, val: bool) {
+        self.in_switch.store(val, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_in_switch(&self) -> bool {
+        self.in_switch.load(Ordering::Acquire)
     }
 
     pub fn new(cpu: ProcessorId) -> Self {
@@ -446,9 +463,9 @@ impl CpuRunQueue {
             prev_irq_time: 0,
             clock_updata_flags: ClockUpdataFlag::empty(),
             overload: false,
-            next_balance: core::sync::atomic::AtomicU64::new(clock().saturating_add(1)),
+            next_balance: AtomicU64::new(clock().saturating_add(1)),
             nr_running: AtomicUsize::new(0),
-            nr_uninterruptible: 0,
+            nr_uninterruptible: AtomicIsize::new(0),
             nr_iowait: AtomicUsize::new(0),
             calc_load_update: clock() + (5 * HZ + 1),
             calc_load_active: 0,
@@ -463,6 +480,7 @@ impl CpuRunQueue {
             current_ptr: AtomicPtr::new(core::ptr::null_mut()),
             idle: Weak::new(),
             sched_domain: None,
+            in_switch: AtomicBool::new(false),
         }
     }
 
@@ -775,19 +793,24 @@ impl CpuRunQueue {
                 continue;
             }
 
-            // 等待任务完成上下文切换后再激活，否则可能在中途激活导致竞态。
-            if pcb.sched_info().on_cpu().is_some() {
-                let mut spins = 0u32;
-                while pcb.sched_info().on_cpu().is_some() {
-                    core::hint::spin_loop();
-                    spins += 1;
-                    if spins > 1_000_000 {
-                        log::warn!(
-                            "drain_wake_queue: pid={:?} on_cpu stuck, force proceed",
-                            pcb.raw_pid()
-                        );
-                        break;
-                    }
+            // 对标 Linux sched_ttwu_pending() 中 WARN_ON_ONCE(p->on_cpu) +
+            // smp_cond_load_acquire(&p->on_cpu, !VAL)：
+            // 正常情况下 IPI 在 finish_task() 清除 on_cpu 之后才到达，
+            // 因此 on_cpu 不应为 Some。此处作为安全兜底等待上下文切换完成。
+            // 阈值 10M（约 10ms）：正常上下文切换在微秒内完成，
+            // 超过此时间说明 on_cpu 卡住（bug），force proceed 以避免
+            // 持 rq lock 死锁整个系统。
+            let mut spins = 0u32;
+            while pcb.sched_info().on_cpu().is_some() {
+                core::hint::spin_loop();
+                core::sync::atomic::fence(Ordering::Acquire);
+                spins += 1;
+                if spins > 10_000_000 {
+                    log::error!(
+                        "drain_wake_queue: pid={:?} on_cpu stuck after 10M spins, force proceed",
+                        pcb.raw_pid()
+                    );
+                    break;
                 }
             }
 
@@ -795,7 +818,6 @@ impl CpuRunQueue {
             let migrated = prev_cpu != cpu;
 
             // 先迁移（set_task_cpu），后在目标 rq（已持锁）上递减。
-            // 先 set_task_cpu(p, cpu_of(rq))，再 ttwu_do_activate 中 rq->nr_uninterruptible-- 在 local rq 上操作。
             if migrated {
                 log::trace!(
                     "drain_wake_queue: migrating pid={:?} prev_cpu={:?} -> local_cpu={:?}",
@@ -803,8 +825,6 @@ impl CpuRunQueue {
                     prev_cpu,
                     cpu
                 );
-                // nr_iowait 必须在 __set_task_cpu 之前在 source rq 递减。
-                // nr_iowait 是 atomic_t，跨 CPU 安全；nr_uninterruptible 则在 set_task_cpu 之后于目标 rq 上递减
                 if pcb
                     .flags()
                     .contains(crate::process::ProcessFlags::IN_IOWAIT)
@@ -814,7 +834,7 @@ impl CpuRunQueue {
                 __set_task_cpu(&pcb, cpu);
             }
 
-            // nr_uninterruptible 在目标 rq（self，已持锁）上递减，对齐 ttwu_do_activate 的处理
+            // nr_uninterruptible 在目标 rq（self，已持锁）上递减
             if pcb
                 .flags()
                 .contains(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
@@ -909,8 +929,7 @@ impl CpuRunQueue {
     }
 
     pub fn add_nr_running(&mut self, nr_running: usize) {
-        let prev = self.nr_running.load(Ordering::Relaxed);
-        self.nr_running.store(prev + nr_running, Ordering::Release);
+        let prev = self.nr_running.fetch_add(nr_running, Ordering::Relaxed);
         loadavg::inc_nr_running(nr_running);
         if prev < 2 && prev + nr_running >= 2 && !self.overload {
             self.overload = true;
@@ -918,18 +937,20 @@ impl CpuRunQueue {
     }
 
     pub fn sub_nr_running(&mut self, count: usize) {
-        let prev = self.nr_running.load(Ordering::Relaxed);
-        let new = prev.saturating_sub(count);
-        self.nr_running.store(new, Ordering::Release);
+        let prev = self.nr_running.fetch_sub(count, Ordering::Relaxed);
+        if prev < count {
+            log::warn!("sub_nr_running underflow: prev={prev} count={count}");
+        }
         loadavg::dec_nr_running(count);
-        if new < 2 && self.overload {
+        if prev.saturating_sub(count) < 2 && self.overload {
             self.overload = false;
         }
     }
 
-    /// 裸递减，不做下溢保护。per-CPU 不精确，正确性由全局总和保证
-    pub fn dec_nr_uninterruptible(&mut self) {
-        self.nr_uninterruptible -= 1;
+    /// per-CPU 计数器，跨 CPU 迁移时允许负数。
+    /// Linux 使用 `unsigned int` 并依赖无符号回绕；DragonOS 使用 `AtomicIsize` 直接表达。
+    pub fn dec_nr_uninterruptible(&self) {
+        self.nr_uninterruptible.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn dec_nr_iowait(&self) {
@@ -1292,25 +1313,24 @@ pub fn scheduler_tick() {
 
     if let Some((cpu, idle_type)) = trigger_load_balance(rq) {
         drop(guard);
-        rebalance::rebalance_domains(cpu, idle_type);
+        crate::exception::workqueue::schedule_work(
+            crate::exception::workqueue::Work::new(move || {
+                rebalance::rebalance_domains(cpu, idle_type);
+            }),
+        );
     } else {
         drop(guard);
     }
 }
 
-/// 触发负载均衡的异步执行
-/// `trigger_load_balance()` 语义：
-/// 1. 检查 `on_null_domain`（domain 未初始化时跳过）
-/// 2. 检查 `jiffies >= rq->next_balance`
-/// 3. 若满足则直接调用 rebalance_domains（在调用者的 tick 上下文中运行）
-///
-/// 与 Linux 的差异：Linux 先 `rq_unlock` 再调用 `raise_softirq`；
-/// DragonOS 在 rq 锁外直接调用 `rebalance_domains`，等效于在 softirq 上下文中运行。
+/// 对标 Linux `trigger_load_balance()`：
+/// 检查时间窗口和 domain 状态，满足条件时通过 workqueue 延迟执行 `rebalance_domains`。
+/// Linux 使用 `raise_softirq(SCHED_SOFTIRQ)`，DragonOS 使用 `schedule_work` 等效。
 fn trigger_load_balance(rq: &CpuRunQueue) -> Option<(ProcessorId, rebalance::CpuIdleType)> {
     let _sd = rq.sched_domain()?;
 
     let jiffies = clock();
-    if jiffies < rq.next_balance.load(core::sync::atomic::Ordering::Relaxed) {
+    if jiffies < rq.next_balance.load(Ordering::Relaxed) {
         return None;
     }
 
@@ -1417,7 +1437,9 @@ pub fn __schedule(sched_mod: SchedMode) {
             voluntary_switch = true;
             let interruptible = matches!(prev_state, ProcessState::Blocked(true));
 
-            let has_signal = Signal::signal_pending_state(interruptible, wake_kill, &prev);
+            // 已退出任务不可被信号重新激活
+            let has_signal =
+                !is_exited && Signal::signal_pending_state(interruptible, wake_kill, &prev);
             if has_signal {
                 // WRITE_ONCE(prev->__state, TASK_RUNNING);
                 // 在同一写锁临界区内将状态设为 Runnable 并清除 sleep/wake_kill 标志，避免中间状态被外部观察。
@@ -1440,7 +1462,7 @@ pub fn __schedule(sched_mod: SchedMode) {
                     matches!(prev_state, ProcessState::Blocked(false)) || wake_kill;
                 if contributes_to_load {
                     prev.flags().insert(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
-                    rq.nr_uninterruptible += 1;
+                    rq.nr_uninterruptible.fetch_add(1, Ordering::Relaxed);
                 } else {
                     prev.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
                 }
@@ -1520,13 +1542,12 @@ pub fn __schedule(sched_mod: SchedMode) {
         // CurrentApic.send_eoi();
         compiler_fence(Ordering::SeqCst);
 
+        // 标记 context_switch 进行中
+        rq.set_in_switch(true);
+
         // This kernel does not hand off rq lock ownership across context switch.
         // Drop it before switching so the incoming task's first tick/wakeup path
         // can acquire the local rq lock normally.
-        //
-        // 已知限制: Linux 在 context_switch 中持有 rq lock，并在 finish_task_switch → finish_lock_switch 中释放。
-        // DragonOS 目前不在上下文切换间传递锁所有权，因此提前释放。由于此窗口内 IRQ 已禁用，
-        // 且 on_cpu 现在在 switch_finish_hook 中清除，实际竞态窗口很小。
         drop(guard);
 
         unsafe { ProcessManager::switch_process(prev, next) };
@@ -1675,6 +1696,9 @@ pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
         let se = pcb.sched_info().sched_entity();
         let rq = cpu_rq(cpu.data() as usize);
         unsafe { se.force_mut().set_cfs(Arc::downgrade(&rq.cfs)) };
+        // 设置 last_update_time = 0 强制 PELT 在新 CPU 上重新同步，
+        // 防止携带旧 CPU 时钟的 stale 负载数据导致 load tracking 漂移。
+        unsafe { se.force_mut().avg.last_update_time = 0 };
     }
 }
 

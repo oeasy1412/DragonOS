@@ -88,8 +88,8 @@ pub(crate) fn dec_nr_threads() {
 
 /// adjust 用于 CPU 热插拔迁移时排除正在迁移的任务（当前传 0）。
 fn calc_load_fold_active(rq: &CpuRunQueue, adjust: isize) -> isize {
-    let nr_active =
-        rq.nr_running.load(Ordering::Relaxed) as isize - adjust + rq.nr_uninterruptible as isize;
+    let nr_active = rq.nr_running.load(Ordering::Relaxed) as isize - adjust
+        + rq.nr_uninterruptible.load(Ordering::Relaxed);
     let delta = nr_active - rq.calc_load_active;
     delta
 }
