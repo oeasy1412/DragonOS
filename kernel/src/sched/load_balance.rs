@@ -35,15 +35,15 @@ const SYSCTL_SCHED_MIGRATION_COST: u64 = 500_000;
 bitflags! {
     /// 负载均衡标志位
     pub struct LbfFlags: u32 {
-        /// 所有候选任务都被钉住（无法迁移到 dst_cpu）  — LBF_ALL_PINNED 0x01
+        /// 所有候选任务都被钉住（无法迁移到 dst_cpu）
         const ALL_PINNED = 1 << 0;
-        /// 需要中断本次遍历（已处理过多任务）        — LBF_NEED_BREAK  0x02
+        /// 需要中断本次遍历（已处理过多任务）
         const NEED_BREAK = 1 << 1;
-        /// dst_cpu 被钉住，需要寻找新的目标 CPU       — LBF_DST_PINNED  0x04
+        /// dst_cpu 被钉住，需要寻找新的目标 CPU
         const DST_PINNED = 1 << 2;
-        /// 至少有一个任务因 cpus_allowed 限制无法迁移 — LBF_SOME_PINNED 0x08
+        /// 至少有一个任务因 cpus_allowed 限制无法迁移
         const SOME_PINNED = 1 << 3;
-        /// 主动均衡（强制迁移 cache-hot 任务）       — LBF_ACTIVE_LB   0x10
+        /// 主动均衡（强制迁移 cache-hot 任务）
         const ACTIVE_LB = 1 << 4;
     }
 }
@@ -76,18 +76,19 @@ impl LoadBalancer {
     /// 这个函数在任务被唤醒时调用，用于选择最适合运行该任务的CPU。
     /// 目前处理 cpus_allowed 掩码、WF_CURRENT_CPU、粗略负载比较以及 wake_affine，
     /// 尚未实现 LLC 域扫描及 sched_domain 层级逻辑。
+    /// `inner` 参数强制调用者必须已持有 pi_lock (inner_locked)。
     pub fn select_task_rq(
         pcb: &Arc<ProcessControlBlock>,
+        inner: &crate::process::InnerSchedInfo,
         prev_cpu: ProcessorId,
         wake_flags: u8,
     ) -> ProcessorId {
-        // select_task_rq：返回值保证是 cpus_allowed 中的有效 CPU。
-        let cpus_allowed = pcb.sched_info().cpus_allowed();
+        let cpus_allowed = inner.cpus_allowed();
         let current_cpu = smp_get_processor_id();
 
         // 如果负载均衡未启用，保持在原CPU（与原有行为一致）
         if !is_load_balance_enabled() {
-            return Self::fallback_if_not_allowed(prev_cpu, prev_cpu, &cpus_allowed);
+            return Self::fallback_if_not_allowed(prev_cpu, prev_cpu, cpus_allowed);
         }
 
         let cpu_manager = smp_cpu_manager();
@@ -95,13 +96,13 @@ impl LoadBalancer {
             return current_cpu;
         }
 
-        let nr_cpus_allowed = pcb.sched_info().nr_cpus_allowed();
+        let nr_cpus_allowed = inner.nr_cpus_allowed();
         if nr_cpus_allowed <= 1 {
             if let Some(cpu) = cpus_allowed.iter_cpu().next() {
                 return cpu;
             }
             // 空 cpus_allowed 是不变量违反，fallback 会 panic。
-            return Self::fallback_if_not_allowed(prev_cpu, prev_cpu, &cpus_allowed);
+            return Self::fallback_if_not_allowed(prev_cpu, prev_cpu, cpus_allowed);
         }
 
         // WF_CURRENT_CPU：如果唤醒者请求将任务放到当前 CPU，优先满足
@@ -113,8 +114,8 @@ impl LoadBalancer {
 
         // 如果是IDLE策略，尝试找一个空闲CPU
         if pcb.sched_info().policy() == SchedPolicy::IDLE {
-            let target = Self::find_idlest_cpu_lockless(&cpus_allowed, current_cpu);
-            return Self::fallback_if_not_allowed(target, prev_cpu, &cpus_allowed);
+            let target = Self::find_idlest_cpu_lockless(cpus_allowed, current_cpu);
+            return Self::fallback_if_not_allowed(target, prev_cpu, cpus_allowed);
         }
 
         let current_rq = cpu_rq(current_cpu.data() as usize);
@@ -148,14 +149,9 @@ impl LoadBalancer {
             return current_cpu;
         }
 
-        // select_task_rq_fair 没有 current_nr == 0 的短路检查。
-        // 保留该检查会导致从 idle 线程唤醒时永远返回 current_cpu（CPU0），
-        // 因为 idle 线程本身不计入 nr_running。正确的做法是让 find_idlest_cpu_lockless
-        // 或 select_idle_sibling 在所有候选 CPU 中做决策。
-
-        let target = Self::find_idlest_cpu_lockless(&cpus_allowed, current_cpu);
-        let target = Self::fallback_if_not_allowed(target, prev_cpu, &cpus_allowed);
-        Self::select_idle_sibling(prev_cpu, target, &cpus_allowed)
+        let target = Self::find_idlest_cpu_lockless(cpus_allowed, current_cpu);
+        let target = Self::fallback_if_not_allowed(target, prev_cpu, cpus_allowed);
+        Self::select_idle_sibling(prev_cpu, target, cpus_allowed)
     }
 
     /// 如果选中的 CPU 不在任务允许掩码中，回退到 `prev_cpu`；
@@ -325,18 +321,21 @@ pub struct LbEnv {
 pub fn update_sg_lb_stats(sg: &SchedGroup, sgs: &mut SgLbStats, env: &LbEnv) {
     *sgs = SgLbStats::default();
 
-    for cpu in sg.cpumask.iter_cpu() {
+    for cpu in (&sg.cpumask & &env.cpus).iter_cpu() {
         let rq = cpu_rq(cpu.data() as usize);
         let load = rq.cfs_load_avg_lockless() as u64;
+        let util = rq.cfs_util_avg_lockless() as u64;
+        let runnable = rq.cfs_runnable_avg_lockless() as u64;
         let nr_running = rq.nr_running_lockless() as u32;
+        let h_nr_running = rq.cfs_h_nr_running_lockless() as u32;
 
         sgs.group_load += load;
-        sgs.group_util += load; // 单层模型下 util 用 load 近似
-        sgs.group_runnable += load;
+        sgs.group_util += util;
+        sgs.group_runnable += runnable;
         sgs.sum_nr_running += nr_running;
-        sgs.sum_h_nr_running += nr_running; // 单层模型下 h_nr_running 用 nr_running 近似
+        sgs.sum_h_nr_running += h_nr_running;
 
-        if nr_running == 0 {
+        if nr_running == 0 && LoadBalancer::is_idle_cpu(cpu) {
             sgs.idle_cpus += 1;
         }
     }
@@ -510,13 +509,13 @@ pub fn find_busiest_queue(env: &LbEnv, group: &SchedGroup) -> Option<ProcessorId
         }
 
         let rq = cpu_rq(cpu.data() as usize);
-        let nr_running = rq.nr_running_lockless() as u32;
+        let nr_running = rq.cfs_h_nr_running_lockless() as u32;
         if nr_running == 0 {
             continue;
         }
 
         let load = rq.cfs_load_avg_lockless() as u64;
-        let util = load; // 单层模型下 util 用 load 近似
+        let util = (rq.cfs_util_avg_lockless() as u64).max(rq.cfs_runnable_avg_lockless() as u64);
         let capacity = SCHED_CAPACITY_SCALE;
 
         match env.migration_type {
@@ -704,7 +703,7 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
                 env.imbalance -= load;
             }
             MigrationType::Util => {
-                let util = se.avg.util_avg.max(1) as u64;
+                let util = se.avg.util_avg.load(Ordering::Relaxed).max(1) as u64;
                 if util > env.imbalance {
                     retry.push_front(se);
                     continue;
@@ -823,74 +822,159 @@ pub fn load_balance(
 
     env.flags |= LbfFlags::ALL_PINNED;
 
+    // 对标 Linux load_balance() 的 redo / more_balance 双层 goto 结构。
+    //
+    // 外层 `redo` 循环：ALL_PINNED 时排除 busiest CPU 后重新搜索
+    // （find_busiest_group + find_busiest_queue），选择不同的源 CPU。
+    // 内层 `more_balance` 循环：NEED_BREAK / DST_PINNED 时在同一源 CPU 上重试 detach。
     let mut ld_moved: u32 = 0;
-    let dst_pinned_limit = group.cpumask.iter_cpu().count();
-    let mut dst_pinned_retries = 0;
 
-    loop {
-        // rq_unlock 只释放 spinlock 不恢复 IRQ，确保 detach→attach 全程 IRQ 禁用。
-        // DragonOS SpinLockGuard::drop 会恢复 IRQ，因此需手动管理。
-        let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
-        local_irq_disable();
+    // redo: 重新搜索 busiest group/queue
+    let mut busiest_cpu = busiest_cpu;
+    let mut redo = true;
+    while redo {
+        redo = false;
 
-        // self_lock_no_irq: 只获取 spinlock + preempt_disable，不动 IRQ 状态。
-        let src_rq_arc = cpu_rq(busiest_cpu.data() as usize);
-        let (src_rq, src_guard) = src_rq_arc.self_lock_no_irq();
-        src_rq.update_rq_clock();
-
-        env.loop_max = src_rq
-            .nr_running_lockless()
-            .min(SCHED_NR_MIGRATE_BREAK as usize) as u32;
-
-        let cur_ld_moved = detach_tasks(src_rq, &mut env);
-
-        // rq_unlock(busiest, &rf): 只释放 spinlock + preempt_enable，
-        // 不恢复 IRQ。任务此时处于 OnRq::Migrating，不会被并发激活。
-        drop(src_guard);
-
-        if cur_ld_moved > 0 {
-            // rq_lock(dst) → attach_tasks → rq_unlock(dst)
-            // IRQ 仍然禁用
-            let dst_rq_arc = cpu_rq(env.dst_cpu.data() as usize);
-            let (dst_rq, dst_guard) = dst_rq_arc.self_lock_no_irq();
-            dst_rq.update_rq_clock();
-            attach_tasks(dst_rq, &mut env);
-            drop(dst_guard);
-            ld_moved += cur_ld_moved;
+        if !super::rebalance::should_we_balance(&env) {
+            *_continue_balancing = false;
+            break;
         }
 
-        // local_irq_restore(rf.flags): 全程 detach+attach 完成后恢复 IRQ。
-        if irq_was_enabled {
-            local_irq_enable();
-        }
-
-        // LBF_NEED_BREAK: 由于 detach/attach 已分离，可安全释放锁后重新获取。
-        if env.flags.contains(LbfFlags::NEED_BREAK) {
-            env.flags.remove(LbfFlags::NEED_BREAK);
-        }
-
-        // LBF_DST_PINNED: 更换 dst_cpu 后重试（上限为组内 CPU 数）
-        if env.flags.contains(LbfFlags::DST_PINNED) && env.imbalance > 0 {
-            dst_pinned_retries += 1;
-            if dst_pinned_retries >= dst_pinned_limit {
+        // 首次进入时使用上面已找到的 busiest_cpu；redo 重入时重新搜索。
+        if busiest_cpu == ProcessorId::INVALID {
+            let group = match find_busiest_group(&mut env) {
+                Some(g) => g,
+                None => {
+                    break;
+                }
+            };
+            busiest_cpu = match find_busiest_queue(&env, &group) {
+                Some(cpu) => cpu,
+                None => {
+                    break;
+                }
+            };
+            if busiest_cpu == env.dst_cpu {
                 break;
             }
-            env.cpus.set(env.dst_cpu, false);
-            env.dst_cpu = env.new_dst_cpu;
-            env.flags.remove(LbfFlags::DST_PINNED);
-            env.loop_ctr = 0;
-            env.loop_break = SCHED_NR_MIGRATE_BREAK;
-            continue;
         }
 
-        break;
+        env.src_cpu = busiest_cpu;
+        env.flags |= LbfFlags::ALL_PINNED;
+        ld_moved = 0;
+
+        let src_rq_arc = cpu_rq(busiest_cpu.data() as usize);
+
+        // 当 nr_running ≤ 1 时跳过 more_balance，保留 ALL_PINNED 标志，
+        // 尾部逻辑走 out_all_pinned 路径（nr_balance_failed=0, interval*=2）。
+        let busiest_nr_running = src_rq_arc.nr_running_lockless();
+        if busiest_nr_running > 1 {
+            // more_balance: 同一 busiest 上重试 detach
+            let dst_pinned_limit = {
+                let sd_groups = env.sd.as_ref().and_then(|sd| sd.groups.as_ref());
+                sd_groups.map(|g| g.cpumask.iter_cpu().count()).unwrap_or(0)
+            };
+            let mut dst_pinned_retries = 0;
+            let mut more_balance = true;
+            while more_balance {
+                more_balance = false;
+
+                // rq_unlock 只释放 spinlock 不恢复 IRQ，确保 detach→attach 全程 IRQ 禁用。
+                // DragonOS SpinLockGuard::drop 会恢复 IRQ，因此需手动管理。
+                let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
+                local_irq_disable();
+
+                // self_lock_no_irq: 只获取 spinlock + preempt_disable，不动 IRQ 状态。
+                let (src_rq, src_guard) = src_rq_arc.self_lock_no_irq();
+                src_rq.update_rq_clock();
+
+                env.loop_max = src_rq
+                    .nr_running_lockless()
+                    .min(SCHED_NR_MIGRATE_BREAK as usize) as u32;
+
+                let cur_ld_moved = detach_tasks(src_rq, &mut env);
+
+                // rq_unlock(busiest, &rf): 只释放 spinlock + preempt_enable，
+                // 不恢复 IRQ。任务此时处于 OnRq::Migrating，不会被并发激活。
+                drop(src_guard);
+
+                if cur_ld_moved > 0 {
+                    // rq_lock(dst) → attach_tasks → rq_unlock(dst)
+                    // IRQ 仍然禁用
+                    let dst_rq_arc = cpu_rq(env.dst_cpu.data() as usize);
+                    let (dst_rq, dst_guard) = dst_rq_arc.self_lock_no_irq();
+                    dst_rq.update_rq_clock();
+                    attach_tasks(dst_rq, &mut env);
+                    drop(dst_guard);
+                    ld_moved += cur_ld_moved;
+                }
+
+                // local_irq_restore(rf.flags): 全程 detach+attach 完成后恢复 IRQ。
+                if irq_was_enabled {
+                    local_irq_enable();
+                }
+
+                // LBF_NEED_BREAK: 已处理过多任务，释放锁后重新获取并从头扫描。
+                if env.flags.contains(LbfFlags::NEED_BREAK) {
+                    env.flags.remove(LbfFlags::NEED_BREAK);
+                    let nr_running = cpu_rq(busiest_cpu.data() as usize).nr_running_lockless();
+                    if env.loop_ctr < nr_running as u32 {
+                        more_balance = true;
+                        continue;
+                    }
+                }
+
+                // DST_PINNED 必须在 ALL_PINNED 之前检查。
+                if env.flags.contains(LbfFlags::DST_PINNED) && env.imbalance > 0 {
+                    dst_pinned_retries += 1;
+                    if dst_pinned_retries >= dst_pinned_limit {
+                        break;
+                    }
+                    env.cpus.set(env.dst_cpu, false);
+                    env.dst_cpu = env.new_dst_cpu;
+                    env.flags.remove(LbfFlags::DST_PINNED);
+                    env.loop_ctr = 0;
+                    env.loop_break = SCHED_NR_MIGRATE_BREAK;
+                    more_balance = true;
+                    continue;
+                }
+
+                // ALL_PINNED
+                if env.flags.contains(LbfFlags::ALL_PINNED) && env.imbalance > 0 {
+                    env.flags.remove(LbfFlags::ALL_PINNED);
+                    // __cpumask_clear_cpu(cpu_of(busiest), cpus)
+                    env.cpus.set(busiest_cpu, false);
+                    let has_external_source = {
+                        let local_group_mask = env
+                            .sd
+                            .as_ref()
+                            .and_then(|sd| sd.groups.as_ref())
+                            .map(|g| &g.cpumask);
+                        match local_group_mask {
+                            Some(local_mask) => env
+                                .cpus
+                                .iter_cpu()
+                                .any(|cpu| local_mask.get(cpu) != Some(true)),
+                            None => env.cpus.iter_cpu().count() > 0,
+                        }
+                    };
+                    if has_external_source {
+                        env.loop_ctr = 0;
+                        env.loop_break = SCHED_NR_MIGRATE_BREAK;
+                        busiest_cpu = ProcessorId::INVALID;
+                        redo = true;
+                        break;
+                    }
+                    // goto out_all_pinned — 无外部源可重试，保留 ALL_PINNED 标志供尾部统计。
+                    env.flags.insert(LbfFlags::ALL_PINNED);
+                    break;
+                }
+            }
+        }
+        // 如果 redo 被设置但 more_balance 循环因 ALL_PINNED 退出，
+        // 外层 while redo 会继续。否则 redo=false，外层循环结束。
     }
 
-    // 对齐 Linux fair.c load_balance 尾部逻辑:
-    //   ld_moved > 0            → nr_balance_failed = 0, balance_interval = min_interval
-    //   ALL_PINNED (out_all_pinned) → nr_balance_failed = 0, balance_interval *= 2
-    //   NewlyIdle               → 不更新 balance_interval
-    //   普通失败                → nr_balance_failed++, balance_interval = min_interval
     if ld_moved > 0 {
         sd.nr_balance_failed.store(0, Ordering::Relaxed);
         sd.balance_interval

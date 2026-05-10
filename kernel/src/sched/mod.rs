@@ -784,6 +784,24 @@ impl CpuRunQueue {
         self.cfs.load_avg_lockless()
     }
 
+    /// 获取 CFS 运行队列的 util_avg（CPU 利用率）。
+    #[inline]
+    pub fn cfs_util_avg_lockless(&self) -> usize {
+        self.cfs.util_avg_lockless()
+    }
+
+    /// 获取 CFS 运行队列的 runnable_avg（可运行时间）。
+    #[inline]
+    pub fn cfs_runnable_avg_lockless(&self) -> usize {
+        self.cfs.runnable_avg_lockless()
+    }
+
+    /// 获取 CFS 运行队列的 h_nr_running（CFS 层任务计数）。
+    #[inline]
+    pub fn cfs_h_nr_running_lockless(&self) -> u64 {
+        self.cfs.h_nr_running
+    }
+
     /// 获取因 IO 阻塞而睡眠的任务数量
     #[inline]
     pub fn nr_iowait(&self) -> usize {
@@ -1636,12 +1654,16 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
     // TODO: p->recent_used_cpu = task_cpu(p); 需要在 PCB 中新增该字段，
     //       以对齐 CFS select_task_rq_fair 的快速路径优化。
 
-    // __set_task_cpu(p, select_task_rq(p, task_cpu(p), WF_FORK));
-    let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
-        pcb,
-        prev_cpu,
-        WakeupFlags::WF_FORK.bits(),
-    );
+    let target_cpu = {
+        let pi_guard = pcb.sched_info().inner_lock_read_irqsave();
+        let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+            pcb,
+            &pi_guard,
+            prev_cpu,
+            WakeupFlags::WF_FORK.bits(),
+        );
+        target_cpu
+    };
     let target_cpu = if target_cpu == ProcessorId::INVALID {
         log::error!(
             "wake_up_new_task: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",

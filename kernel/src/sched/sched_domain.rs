@@ -128,31 +128,31 @@ pub struct SchedDomain {
 /// 未实现 NUMA balancing 相关字段。
 #[derive(Debug, Default, Clone)]
 pub struct SgLbStats {
-    /// `avg_load` - 组内 CPU 的平均负载
+    /// 组内 CPU 的平均负载
     pub avg_load: u64,
-    /// `group_load` - 组内所有 CPU 的总负载
+    /// 组内所有 CPU 的总负载
     pub group_load: u64,
-    /// `group_capacity` - 组容量
+    /// 组容量
     pub group_capacity: u64,
-    /// `group_util` - 组内所有 CPU 的总利用率
+    /// 组内所有 CPU 的总利用率
     pub group_util: u64,
-    /// `group_runnable` - 组内所有 CPU 的总可运行时间
+    /// 组内所有 CPU 的总可运行时间
     pub group_runnable: u64,
-    /// `sum_nr_running` - 组内运行的任务数
+    /// 组内运行的任务数
     pub sum_nr_running: u32,
-    /// `sum_h_nr_running` - 组内运行的 CFS 任务数
+    /// 组内运行的 CFS 任务数
     pub sum_h_nr_running: u32,
-    /// `idle_cpus` - 组内空闲 CPU 数量
+    /// 组内空闲 CPU 数量
     pub idle_cpus: u32,
-    /// `group_weight` - 组权重
+    /// 组权重
     pub group_weight: u32,
-    /// `group_type` - 组类型
+    /// 组类型
     pub group_type: GroupType,
-    /// `group_asym_packing` - 任务应迁移到首选 CPU
+    /// 任务应迁移到首选 CPU
     pub group_asym_packing: u32,
-    /// `group_smt_balance` - 繁忙 SMT 上的任务应被迁移
+    /// 繁忙 SMT 上的任务应被迁移
     pub group_smt_balance: u32,
-    /// `group_misfit_task_load` - 某 CPU 上有任务超出其容量
+    /// 某 CPU 上有任务超出其容量
     pub group_misfit_task_load: u64,
 }
 

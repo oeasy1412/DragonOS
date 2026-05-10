@@ -35,8 +35,8 @@ pub struct SchedulerAvg {
     pub period_contrib: u32,
 
     pub load_avg: AtomicUsize,
-    pub runnable_avg: usize,
-    pub util_avg: usize,
+    pub runnable_avg: AtomicUsize,
+    pub util_avg: AtomicUsize,
 }
 
 impl SchedulerAvg {
@@ -161,8 +161,10 @@ impl SchedulerAvg {
 
         self.load_avg
             .store((load * self.load_sum) as usize / divider, Ordering::Relaxed);
-        self.runnable_avg = self.runnable_sum as usize / divider;
-        self.util_avg = self.util_sum as usize / divider;
+        self.runnable_avg
+            .store(self.runnable_sum as usize / divider, Ordering::Relaxed);
+        self.util_avg
+            .store(self.util_sum as usize / divider, Ordering::Relaxed);
     }
 
     /// 为新 fork 的 task 初始化 PELT 平均值
@@ -182,22 +184,25 @@ impl SchedulerAvg {
             return;
         }
 
-        let cap = (cpu_scale as isize - cfs_rq.avg.util_avg as isize) / 2;
+        let cap = (cpu_scale as isize - cfs_rq.avg.util_avg.load(Ordering::Relaxed) as isize) / 2;
 
         if cap > 0 {
-            if cfs_rq.avg.util_avg != 0 {
-                sa.util_avg = cfs_rq.avg.util_avg * se.load.weight as usize;
-                sa.util_avg /= cfs_rq.avg.load_avg.load(Ordering::Relaxed) + 1;
+            if cfs_rq.avg.util_avg.load(Ordering::Relaxed) != 0 {
+                let mut util =
+                    cfs_rq.avg.util_avg.load(Ordering::Relaxed) * se.load.weight as usize;
+                util /= cfs_rq.avg.load_avg.load(Ordering::Relaxed) + 1;
 
-                if sa.util_avg as isize > cap {
-                    sa.util_avg = cap as usize;
+                if util as isize > cap {
+                    util = cap as usize;
                 }
+                sa.util_avg.store(util, Ordering::Relaxed);
             } else {
-                sa.util_avg = cap as usize;
+                sa.util_avg.store(cap as usize, Ordering::Relaxed);
             }
         }
 
-        sa.runnable_avg = sa.util_avg;
+        sa.runnable_avg
+            .store(sa.util_avg.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 }
 
@@ -254,12 +259,4 @@ bitflags! {
 pub fn add_positive(x: &mut isize, y: isize) {
     let res = *x + y;
     *x = res.max(0);
-}
-
-pub fn sub_positive(x: &mut usize, y: usize) {
-    if *x > y {
-        *x -= y;
-    } else {
-        *x = 0;
-    }
 }

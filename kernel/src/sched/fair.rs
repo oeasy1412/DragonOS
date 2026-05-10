@@ -1,24 +1,19 @@
-use core::intrinsics::likely;
-use core::intrinsics::unlikely;
-use core::mem::swap;
-use core::sync::atomic::fence;
-use core::sync::atomic::{AtomicU64, Ordering};
-
-use crate::libs::rbtree::RBTree;
-use crate::libs::spinlock::SpinLock;
-use crate::process::ProcessControlBlock;
-use crate::process::ProcessFlags;
-use crate::sched::clock::ClockUpdataFlag;
-use crate::sched::{SchedFeature, SCHED_FEATURES};
-use crate::time::jiffies::TICK_NESC;
-use crate::time::timer::clock;
-use crate::time::NSEC_PER_MSEC;
-use alloc::sync::{Arc, Weak};
-
-use super::pelt::{add_positive, sub_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER};
 use super::{
+    pelt::{add_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER},
     CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, SchedPolicy, Scheduler, TaskGroup,
     WakeupFlags, SCHED_CAPACITY_SHIFT,
+};
+use crate::{
+    libs::{rbtree::RBTree, spinlock::SpinLock},
+    process::{ProcessControlBlock, ProcessFlags},
+    sched::{clock::ClockUpdataFlag, SchedFeature, SCHED_FEATURES},
+    time::{jiffies::TICK_NESC, timer::clock, NSEC_PER_MSEC},
+};
+use alloc::sync::{Arc, Weak};
+use core::{
+    intrinsics::{likely, unlikely},
+    mem::swap,
+    sync::atomic::{fence, AtomicU64, Ordering},
 };
 
 /// 用于设置 CPU-bound 任务的最小抢占粒度的参数。
@@ -864,25 +859,32 @@ impl CfsRunQueue {
     fn detach_entity_load_avg(&mut self, se: &Arc<FairSchedEntity>) {
         self.dequeue_load_avg(se);
 
-        sub_positive(&mut self.avg.util_avg, se.avg.util_avg);
-        sub_positive(&mut (self.avg.util_sum as usize), se.avg.util_sum as usize);
+        let curr_util = self.avg.util_avg.load(Ordering::Relaxed);
+        // saturating_sub 等价于手写的 sub_positive
+        self.avg.util_avg.store(
+            curr_util.saturating_sub(se.avg.util_avg.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        self.avg.util_sum = self.avg.util_sum.saturating_sub(se.avg.util_sum);
         self.avg.util_sum = self
             .avg
             .util_sum
-            .max((self.avg.util_avg * PELT_MIN_DIVIDER) as u64);
+            .max((self.avg.util_avg.load(Ordering::Relaxed) * PELT_MIN_DIVIDER) as u64);
 
-        sub_positive(&mut self.avg.runnable_avg, se.avg.runnable_avg);
-        sub_positive(
-            &mut (self.avg.runnable_sum as usize),
-            se.avg.runnable_sum as usize,
+        let curr_runnable = self.avg.runnable_avg.load(Ordering::Relaxed);
+        self.avg.runnable_avg.store(
+            curr_runnable.saturating_sub(se.avg.runnable_avg.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
         );
+        self.avg.runnable_sum = self.avg.runnable_sum.saturating_sub(se.avg.runnable_sum);
         self.avg.runnable_sum = self
             .avg
             .runnable_sum
-            .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
+            .max((self.avg.runnable_avg.load(Ordering::Relaxed) * PELT_MIN_DIVIDER) as u64);
 
         self.propagate = 1;
-        self.prop_runnable_sum += se.avg.load_sum as isize;
+        // detach 时传递负值（与 attach 的正值相反）
+        self.prop_runnable_sum -= se.avg.load_sum as isize;
     }
 
     fn attach_entity_load_avg(&mut self, se: &Arc<FairSchedEntity>) {
@@ -892,24 +894,28 @@ impl CfsRunQueue {
         se_mut.avg.last_update_time = self.avg.last_update_time;
         se_mut.avg.period_contrib = self.avg.period_contrib;
 
-        se_mut.avg.util_sum = (se_mut.avg.util_avg * divider) as u64;
-        se_mut.avg.runnable_sum = (se_mut.avg.runnable_avg * divider) as u64;
+        se_mut.avg.util_sum = (se_mut.avg.util_avg.load(Ordering::Relaxed) * divider) as u64;
+        se_mut.avg.runnable_sum =
+            (se_mut.avg.runnable_avg.load(Ordering::Relaxed) * divider) as u64;
 
         let scaled_weight = LoadWeight::scale_load_down(se_mut.load.weight);
         let load_sum_product = (se_mut.avg.load_avg.load(Ordering::Relaxed) * divider) as u64;
-        if load_sum_product > scaled_weight && scaled_weight > 0 {
+        if scaled_weight > 0 && load_sum_product > scaled_weight {
             se_mut.avg.load_sum = load_sum_product / scaled_weight;
-        } else if se_mut.avg.load_avg.load(Ordering::Relaxed) > 0 {
-            se_mut.avg.load_sum = 1;
         } else {
-            se_mut.avg.load_sum = 0;
+            se_mut.avg.load_sum = 1;
         }
 
         self.enqueue_load_avg(se.clone());
 
-        self.avg.util_avg += se.avg.util_avg;
+        self.avg
+            .util_avg
+            .fetch_add(se.avg.util_avg.load(Ordering::Relaxed), Ordering::Relaxed);
         self.avg.util_sum += se.avg.util_sum;
-        self.avg.runnable_avg += se.avg.runnable_avg;
+        self.avg.runnable_avg.fetch_add(
+            se.avg.runnable_avg.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.avg.runnable_sum += se.avg.runnable_sum;
 
         self.propagate = 1;
@@ -939,28 +945,33 @@ impl CfsRunQueue {
                 self.avg
                     .load_avg
                     .store(curr.saturating_sub(r), Ordering::Relaxed);
-                sub_positive(&mut (self.avg.load_sum as usize), r * divider);
-
+                self.avg.load_sum = self.avg.load_sum.saturating_sub((r * divider) as u64);
                 self.avg.load_sum = self
                     .avg
                     .load_sum
                     .max((self.avg.load_avg.load(Ordering::Relaxed) * PELT_MIN_DIVIDER) as u64);
 
                 r = removed_util;
-                sub_positive(&mut self.avg.util_avg, r);
-                sub_positive(&mut (self.avg.util_sum as usize), r * divider);
+                let curr_util = self.avg.util_avg.load(Ordering::Relaxed);
+                self.avg
+                    .util_avg
+                    .store(curr_util.saturating_sub(r), Ordering::Relaxed);
+                self.avg.util_sum = self.avg.util_sum.saturating_sub((r * divider) as u64);
                 self.avg.util_sum = self
                     .avg
                     .util_sum
-                    .max((self.avg.util_avg * PELT_MIN_DIVIDER) as u64);
+                    .max((self.avg.util_avg.load(Ordering::Relaxed) * PELT_MIN_DIVIDER) as u64);
 
                 r = removed_runnable;
-                sub_positive(&mut self.avg.runnable_avg, r);
-                sub_positive(&mut (self.avg.runnable_sum as usize), r * divider);
+                let curr_runnable = self.avg.runnable_avg.load(Ordering::Relaxed);
+                self.avg
+                    .runnable_avg
+                    .store(curr_runnable.saturating_sub(r), Ordering::Relaxed);
+                self.avg.runnable_sum = self.avg.runnable_sum.saturating_sub((r * divider) as u64);
                 self.avg.runnable_sum = self
                     .avg
                     .runnable_sum
-                    .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
+                    .max((self.avg.runnable_avg.load(Ordering::Relaxed) * PELT_MIN_DIVIDER) as u64);
 
                 decayed = 1;
             }
@@ -1236,6 +1247,18 @@ impl CfsRunQueue {
         self.avg.load_avg.load(Ordering::Relaxed)
     }
 
+    /// 获取 CFS 运行队列的 util_avg（CPU 利用率）。
+    #[inline]
+    pub fn util_avg_lockless(&self) -> usize {
+        self.avg.util_avg.load(Ordering::Relaxed)
+    }
+
+    /// 获取 CFS 运行队列的 runnable_avg（可运行时间）。
+    #[inline]
+    pub fn runnable_avg_lockless(&self) -> usize {
+        self.avg.runnable_avg.load(Ordering::Relaxed)
+    }
+
     pub fn enqueue_load_avg(&mut self, se: Arc<FairSchedEntity>) {
         self.avg
             .load_avg
@@ -1267,10 +1290,8 @@ impl CfsRunQueue {
     }
 
     pub fn update_task_group_util(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueue) {
-        let mut delta_sum = gcfs_rq.avg.load_avg.load(Ordering::Relaxed) as isize
-            - se.avg.load_avg.load(Ordering::Relaxed) as isize;
-        let delta_avg = delta_sum;
-
+        let delta_avg = gcfs_rq.avg.util_avg.load(Ordering::Relaxed) as isize
+            - se.avg.util_avg.load(Ordering::Relaxed) as isize;
         if delta_avg == 0 {
             return;
         }
@@ -1278,24 +1299,29 @@ impl CfsRunQueue {
         let divider = self.avg.get_pelt_divider();
 
         let se = unsafe { se.force_mut() };
-        se.avg.util_avg = gcfs_rq.avg.util_avg;
-        let new_sum = se.avg.util_avg * divider;
-        delta_sum = new_sum as isize - se.avg.util_sum as isize;
-
+        se.avg.util_avg.store(
+            gcfs_rq.avg.util_avg.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        let new_sum = se.avg.util_avg.load(Ordering::Relaxed) * divider;
+        let delta_sum = new_sum as isize - se.avg.util_sum as isize;
         se.avg.util_sum = new_sum as u64;
 
-        add_positive(&mut (self.avg.util_avg as isize), delta_avg);
-        add_positive(&mut (self.avg.util_sum as isize), delta_sum);
+        let new_util_avg =
+            (self.avg.util_avg.load(Ordering::Relaxed) as isize + delta_avg).max(0) as usize;
+        self.avg.util_avg.store(new_util_avg, Ordering::Relaxed);
+        let new_util_sum = (self.avg.util_sum as isize + delta_sum).max(0) as u64;
+        self.avg.util_sum = new_util_sum;
 
         self.avg.util_sum = self
             .avg
             .util_sum
-            .max((self.avg.util_avg * PELT_MIN_DIVIDER) as u64);
+            .max((self.avg.util_avg.load(Ordering::Relaxed) * PELT_MIN_DIVIDER) as u64);
     }
 
     pub fn update_task_group_runnable(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &CfsRunQueue) {
-        let mut delta_sum = gcfs_rq.avg.runnable_avg as isize - se.avg.runnable_avg as isize;
-        let delta_avg = delta_sum;
+        let delta_avg = gcfs_rq.avg.runnable_avg.load(Ordering::Relaxed) as isize
+            - se.avg.runnable_avg.load(Ordering::Relaxed) as isize;
 
         if delta_avg == 0 {
             return;
@@ -1304,19 +1330,26 @@ impl CfsRunQueue {
         let divider = self.avg.get_pelt_divider();
 
         let se = unsafe { se.force_mut() };
-        se.avg.runnable_avg = gcfs_rq.avg.runnable_avg;
-        let new_sum = se.avg.runnable_sum * divider as u64;
-        delta_sum = new_sum as isize - se.avg.runnable_sum as isize;
+        se.avg.runnable_avg.store(
+            gcfs_rq.avg.runnable_avg.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        let new_sum = se.avg.runnable_avg.load(Ordering::Relaxed) * divider;
+        let delta_sum = new_sum as isize - se.avg.runnable_sum as isize;
+        se.avg.runnable_sum = new_sum as u64;
 
-        se.avg.runnable_sum = new_sum;
-
-        add_positive(&mut (self.avg.runnable_avg as isize), delta_avg);
-        add_positive(&mut (self.avg.runnable_sum as isize), delta_sum);
+        let new_runnable_avg =
+            (self.avg.runnable_avg.load(Ordering::Relaxed) as isize + delta_avg).max(0) as usize;
+        self.avg
+            .runnable_avg
+            .store(new_runnable_avg, Ordering::Relaxed);
+        let new_runnable_sum = (self.avg.runnable_sum as isize + delta_sum).max(0) as u64;
+        self.avg.runnable_sum = new_runnable_sum;
 
         self.avg.runnable_sum = self
             .avg
             .runnable_sum
-            .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
+            .max((self.avg.runnable_avg.load(Ordering::Relaxed) * PELT_MIN_DIVIDER) as u64);
     }
 
     pub fn update_task_group_load(&mut self, se: Arc<FairSchedEntity>, gcfs_rq: &mut CfsRunQueue) {
@@ -1366,7 +1399,9 @@ impl CfsRunQueue {
         self.avg
             .load_avg
             .store(curr_load_avg as usize, Ordering::Relaxed);
-        add_positive(&mut (self.avg.util_sum as isize), delta_sum);
+        // add_positive(&cfs_rq->avg.load_sum, delta_sum) — NOT util_sum
+        let new_load_sum = (self.avg.load_sum as isize + delta_sum).max(0) as u64;
+        self.avg.load_sum = new_load_sum;
 
         self.avg.load_sum = self
             .avg

@@ -294,25 +294,30 @@ impl ProcessManager {
     ) {
         ProcessManager::current_pcb().sched_info().record_wakee(pcb);
 
-        let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
-            pcb,
-            prev_cpu,
-            wake_flags.bits(),
-        );
-
-        let target_cpu = if target_cpu == ProcessorId::INVALID {
-            log::warn!(
-                "ttwu_do_activate: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
-                pcb.raw_pid()
+        // Linux try_to_wake_up: select_task_rq 在 pi_lock 保护下调用。
+        // 但 pi_lock 必须在 ttwu_queue（发 IPI）之前释放，
+        // 否则远程 CPU 的 IPI handler 若需 pi_lock 会导致跨 CPU 死锁。
+        let target_cpu = {
+            let sched_info_guard = pcb.sched_info().inner_lock_read_irqsave();
+            let cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+                pcb,
+                &sched_info_guard,
+                prev_cpu,
+                wake_flags.bits(),
             );
-            smp_get_processor_id()
-        } else {
-            target_cpu
+            if cpu == ProcessorId::INVALID {
+                log::warn!(
+                    "ttwu_do_activate: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
+                    pcb.raw_pid()
+                );
+                smp_get_processor_id()
+            } else {
+                cpu
+            }
         };
+        // pi_lock 已释放，现在安全调用 ttwu_queue（发送 IPI）
 
         if target_cpu != smp_get_processor_id() {
-            // 远程唤醒：将任务挂到目标 CPU 的 WakeQueue，由目标 CPU 的 IPI handler
-            // 负责在正确的 source rq 上递减 nr_iowait 并执行 __set_task_cpu。
             crate::sched::ttwu_queue(pcb, target_cpu, wake_flags);
             return;
         }
@@ -2554,8 +2559,6 @@ pub struct ProcessSchedulerInfo {
     pub sched_entity: Arc<FairSchedEntity>,
     /// 由 rq lock 保护的普通字段。
     pub(crate) on_rq: OnRqCell,
-    pub cpus_allowed: SpinLock<CpuMask>,
-    pub nr_cpus_allowed: AtomicUsize,
 
     pub prio_data: RwLock<PrioData>,
 
@@ -2606,11 +2609,26 @@ pub struct InnerSchedInfo {
     /// TASK_WAKEKILL：仅 fatal signal 可唤醒。
     /// 由 mark_sleep_killable() 设置，__schedule 读取后通过 set_wakeup() 清除。
     wake_kill: bool,
+
+    /// 由 pi_lock 独占保护的 CPU 亲和性掩码。
+    cpus_allowed: CpuMask,
+    nr_cpus_allowed: usize,
 }
 
 impl InnerSchedInfo {
+    pub fn new(cpus_allowed: CpuMask) -> Self {
+        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
+        Self {
+            state: ProcessState::Blocked(false),
+            sleep: false,
+            wake_kill: false,
+            cpus_allowed,
+            nr_cpus_allowed,
+        }
+    }
+
     pub fn state(&self) -> ProcessState {
-        return self.state;
+        self.state
     }
 
     pub fn set_state(&mut self, state: ProcessState) {
@@ -2637,6 +2655,22 @@ impl InnerSchedInfo {
     pub fn set_wake_kill(&mut self) {
         self.wake_kill = true;
     }
+
+    /// 读取 cpus_allowed（需在 pi_lock 保护下调用）。
+    pub fn cpus_allowed(&self) -> &CpuMask {
+        &self.cpus_allowed
+    }
+
+    /// 写入 cpus_allowed（需在 pi_lock 写锁保护下调用）。
+    pub fn set_cpus_allowed(&mut self, new_mask: CpuMask) {
+        self.cpus_allowed = new_mask;
+        self.nr_cpus_allowed = self.cpus_allowed.iter_cpu().count();
+    }
+
+    /// 读取 nr_cpus_allowed（需在 pi_lock 保护下调用）。
+    pub fn nr_cpus_allowed(&self) -> usize {
+        self.nr_cpus_allowed
+    }
 }
 
 impl ProcessSchedulerInfo {
@@ -2655,16 +2689,11 @@ impl ProcessSchedulerInfo {
     pub fn new(on_cpu: Option<ProcessorId>) -> Self {
         let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
         let cpus_allowed = Self::default_cpus_allowed();
-        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
             cpu: AtomicProcessorId::new(cpu_id),
             // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
-            inner_locked: RwLock::new(InnerSchedInfo {
-                state: ProcessState::Blocked(false),
-                sleep: false,
-                wake_kill: false,
-            }),
+            inner_locked: RwLock::new(InnerSchedInfo::new(cpus_allowed)),
             // virtual_runtime: AtomicIsize::new(0),
             // rt_time_slice: AtomicIsize::new(0),
             // priority: SchedPriority::new(100).unwrap(),
@@ -2672,8 +2701,6 @@ impl ProcessSchedulerInfo {
             sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
             sched_entity: FairSchedEntity::new(),
             on_rq: OnRqCell::new(OnRq::None),
-            cpus_allowed: SpinLock::new(cpus_allowed),
-            nr_cpus_allowed: AtomicUsize::new(nr_cpus_allowed),
             prio_data: RwLock::new(PrioData::default()),
             wakee_flips: AtomicUsize::new(0),
             last_wakee: AtomicUsize::new(0),
@@ -2796,18 +2823,17 @@ impl ProcessSchedulerInfo {
     }
 
     pub fn cpus_allowed(&self) -> CpuMask {
-        self.cpus_allowed.lock_irqsave().clone()
+        self.inner_locked.read_irqsave().cpus_allowed().clone()
     }
 
     pub fn nr_cpus_allowed(&self) -> usize {
-        self.nr_cpus_allowed.load(Ordering::SeqCst)
+        self.inner_locked.read_irqsave().nr_cpus_allowed()
     }
 
     pub fn set_cpus_allowed(&self, cpus_allowed: CpuMask) {
-        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
-        *self.cpus_allowed.lock_irqsave() = cpus_allowed;
-        self.nr_cpus_allowed
-            .store(nr_cpus_allowed, Ordering::SeqCst);
+        self.inner_locked
+            .write_irqsave()
+            .set_cpus_allowed(cpus_allowed);
     }
 
     /// 记录唤醒关系，用于 `wake_wide` 判断。
