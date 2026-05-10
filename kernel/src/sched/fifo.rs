@@ -119,7 +119,7 @@ impl Scheduler for FifoScheduler {
         rq.resched_current();
     }
 
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<ProcessControlBlock>,
         _flags: WakeupFlags,

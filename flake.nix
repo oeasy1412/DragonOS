@@ -142,8 +142,6 @@
                 # QEMU 相关参数：
                 # 内核位置
                 kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-                # -s -S
-                debug = false;
                 enableVsock = vsockConfig.enable;
                 vsockGuestCid = vsockConfig.guestCid;
                 vsockDeviceModel = vsockConfig.deviceModel;
@@ -160,8 +158,6 @@
                 # QEMU 相关参数：
                 # 内核位置
                 kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-                # -s -S
-                debug = false;
                 enableVsock = vsockConfig.enable;
                 vsockGuestCid = vsockConfig.guestCid;
                 vsockDeviceModel = vsockConfig.deviceModel;
@@ -187,6 +183,23 @@
                   diskPath
                   ;
               };
+
+              gdbBin = if target == "x86_64" then "rust-gdb" else "gdb-multiarch";
+              gdbScript = pkgs.writeScriptBin "dragonos-gdb" ''
+                #!${pkgs.runtimeShell}
+                GDB_PORT_FILE="${buildDir}/vmstate/gdb"
+                if [ ! -f "$GDB_PORT_FILE" ]; then
+                  echo "Error: VM not running or GDB port not allocated"
+                  echo "Start VM first: nix run .#start-''${target}"
+                  exit 1
+                fi
+                GDB_PORT=$(cat "$GDB_PORT_FILE")
+                GDB_INIT_TMP=$(mktemp)
+                trap "rm -f $GDB_INIT_TMP" EXIT
+                sed "s/{{GDB_PORT}}/$GDB_PORT/" ${./tools/.gdbinit} > "$GDB_INIT_TMP"
+                echo "Connecting to GDB port: $GDB_PORT"
+                exec ${gdbBin} -n -x "$GDB_INIT_TMP"
+              '';
 
               # 一键化构建启动脚本 (yolo: You Only Live Once - 一条命令跑通全部)
               runApp = pkgs.writeScriptBin "dragonos-yolo" ''
@@ -233,12 +246,18 @@
                   program = "${rootfsPkg}/bin/dragonos-rootfs";
                   meta.description = "构建 ${target} rootfs 镜像";
                 };
+                "gdb-${target}" = {
+                  type = "app";
+                  program = "${gdbScript}/bin/dragonos-gdb";
+                  meta.description = "Connect GDB to running DragonOS (${target})";
+                };
               };
               packages = {
                 "yolo-${target}" = runApp;
                 "start-${target}" = startPkg;
                 "start-system-${target}" = startSystemPkg;
                 "rootfs-${target}" = rootfsPkg;
+                "gdb-${target}" = gdbScript;
               };
             };
 

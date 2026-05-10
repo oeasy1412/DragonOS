@@ -11,6 +11,20 @@ pub fn local_irq_save() -> usize {
 }
 
 #[inline]
+pub fn local_irq_disable() {
+    unsafe {
+        asm!("cli", options(nomem, preserves_flags));
+    }
+}
+
+#[inline]
+pub fn local_irq_enable() {
+    unsafe {
+        asm!("sti", options(nomem, preserves_flags));
+    }
+}
+
+#[inline]
 // 恢复先前保存的rflags的值x
 pub fn local_irq_restore(x: usize) {
     unsafe {

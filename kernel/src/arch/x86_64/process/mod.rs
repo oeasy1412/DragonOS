@@ -436,7 +436,15 @@ impl ProcessManager {
 
         (*prev_arch).rip = switch_back as usize;
 
-        // 恢复当前的 preempt count*2
+        // preempt_count 平衡：context switch 路径中共有 3 次 preempt_disable，
+        // 全部发生在 prev (current) 上：
+        //   1. __schedule self_lock_no_irq → try_lock → preempt_disable
+        //   2. prev.arch_info_irqsave → lock_irqsave → preempt_disable
+        //   3. next.arch_info_irqsave → lock_irqsave → preempt_disable
+        // 3 个 guard 全部被 leak，后续由 force_unlock 释放锁但不做 preempt_enable。
+        // 因此在 context switch 前（仍在 prev 栈上）用 3 次 preempt_enable 对消。
+        // switch_finish_hook 中不需要再做 preempt_enable。
+        ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
         ProcessManager::current_pcb().preempt_enable();
 

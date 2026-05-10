@@ -143,7 +143,7 @@ impl AddressSpace {
         let vm = ProcessManager::current_pcb()
             .basic()
             .user_vm()
-            .expect("Current process has no address space");
+            .ok_or(SystemError::ESRCH)?;
 
         return Ok(vm);
     }

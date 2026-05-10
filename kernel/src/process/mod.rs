@@ -141,6 +141,7 @@ static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
     pub next_pcb: Option<Arc<ProcessControlBlock>>,
+    pub prev_mm: Option<Arc<AddressSpace>>,
 }
 
 impl SwitchResult {
@@ -148,6 +149,7 @@ impl SwitchResult {
         Self {
             prev_pcb: None,
             next_pcb: None,
+            prev_mm: None,
         }
     }
 }
@@ -350,7 +352,7 @@ impl ProcessManager {
         }
 
         rq.activate_task(pcb, flags);
-        rq.check_preempt_currnet(pcb, wake_flags);
+        rq.check_preempt_current(pcb, wake_flags);
     }
 
     /// 唤醒一个进程
@@ -390,7 +392,7 @@ impl ProcessManager {
                     let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
                     if on_rq == OnRq::Queued {
                         rq_ref.update_rq_clock();
-                        rq_ref.check_preempt_currnet(pcb, WakeupFlags::WF_TTWU);
+                        rq_ref.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
                         drop(guard);
                         return Ok(());
                     }
@@ -444,7 +446,7 @@ impl ProcessManager {
         // 先获取 task 所在 CPU 的 rq 锁，再操作 on_rq
         // 避免与 load_balance / activate_task 的 rq -> on_rq 顺序产生 ABBA 死锁。
         let target_cpu = task_cpu(pcb);
-        let rq = crate::sched::cpu_rq(target_cpu.data() as usize);
+        let rq = cpu_rq(target_cpu.data() as usize);
         let (rq, _rq_guard) = rq.self_lock();
 
         let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
@@ -480,7 +482,7 @@ impl ProcessManager {
             }
 
             if update_clock {
-                rq.check_preempt_currnet(pcb, crate::sched::WakeupFlags::empty());
+                rq.check_preempt_current(pcb, crate::sched::WakeupFlags::empty());
             } else {
                 rq.check_preempt_remote(pcb, crate::sched::WakeupFlags::empty());
             }
@@ -847,7 +849,20 @@ impl ProcessManager {
                 }
             }
 
+            // exit_mm()：
+            // 1. 将 current->mm 置为 NULL，使当前进程变为“内核线程”状态；
+            // 2. 通过 PROCESS_SWITCH_RESULT.prev_mm 持有一个额外引用，
+            //    防止 mm 在 set_user_vm(None) 后立即被 Drop；
+            // 3. 在 switch_finish_hook() 中 rq.force_unlock() 之后再释放该引用，
+            //    确保 AddressSpace::drop（可能触发 TLB shootdown → wakeup → ttwu_do_activate
+            //    → rq.self_lock()）不会在 rq 锁内执行，避免死锁。
+            let prev_mm = pcb.basic().user_vm();
             unsafe { pcb.basic_mut().set_user_vm(None) };
+            if let Some(mm) = prev_mm {
+                unsafe {
+                    PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_mm = Some(mm);
+                }
+            }
 
             drop(pcb);
 
@@ -1009,21 +1024,34 @@ impl ProcessManager {
             .expect("next_pcb is None");
 
         // finish_task(prev): smp_store_release(&prev->on_cpu, 0)
+        // Pairs with smp_cond_load_acquire in wakeup / drain_wake_queue.
         prev_pcb.sched_info().set_on_cpu(None);
 
-        // 清除 in_switch 标志
-        // 必须在 on_cpu 清除之后：远程 CPU 看到 in_switch=false 后可以安全 activate。
-        let cpu = crate::smp::core::smp_get_processor_id();
-        crate::sched::cpu_rq(cpu.data() as usize).set_in_switch(false);
-
-        // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
-        fence(Ordering::SeqCst);
-
+        // 释放 switch_process 中 SpinLockGuard::leak() 泄漏的 arch_info 锁。
+        // 必须在 rq unlock 和 preempt_enable 之前完成：
+        // preempt_enable 后若发生抢占，新任务可能尝试获取同一 arch_info 锁导致死锁。
         prev_pcb.arch_info.force_unlock();
-        fence(Ordering::SeqCst);
-
         next_pcb.arch_info.force_unlock();
-        fence(Ordering::SeqCst);
+
+        // 释放 __schedule 中 core::mem::forget(guard) 泄漏的 rq lock。
+        // 对标 Linux finish_lock_switch:
+        //   spin_acquire + __balance_callbacks + raw_spin_rq_unlock_irq(rq)
+        // force_unlock = raw_spin_rq_unlock; local_irq_enable = unlock_irq 中的 enable。
+        let cpu = smp_get_processor_id();
+        let rq = cpu_rq(cpu.data() as usize);
+        unsafe { rq.force_unlock() };
+        crate::arch::asm::irqflags::local_irq_enable();
+
+        // 释放 exit() 中存入 PROCESS_SWITCH_RESULT.prev_mm 的 AddressSpace 引用。
+        // 在 IRQ enable 之后做 mmdrop，因为 mmdrop 可能睡眠（synchronize_rcu）
+        let _prev_mm = unsafe {
+            PROCESS_SWITCH_RESULT
+                .as_mut()
+                .unwrap()
+                .get_mut()
+                .prev_mm
+                .take()
+        };
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态

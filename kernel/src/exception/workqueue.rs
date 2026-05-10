@@ -61,8 +61,11 @@ impl WorkQueue {
     }
 
     /// Enqueue a work item to the workqueue.
+    ///
+    /// 使用 lock_irqsave() 等效于 Linux 的 local_irq_save() + raw_spin_lock_irq(&pool->lock)
+    /// 防止在持锁期间被同一 CPU 的中断重入导致死锁。
     pub fn enqueue(&self, work: Arc<Work>) {
-        self.queue.lock().push_back(work);
+        self.queue.lock_irqsave().push_back(work);
         self.wait_queue.wakeup(None);
     }
 }
@@ -73,11 +76,11 @@ fn worker_loop(wq: Arc<WorkQueue>) -> i32 {
         // Wait for work
         let _ = wq
             .wait_queue
-            .wait_event_interruptible(|| !wq.queue.lock().is_empty(), None::<fn()>);
+            .wait_event_interruptible(|| !wq.queue.lock_irqsave().is_empty(), None::<fn()>);
 
         // Process works
         loop {
-            let work = wq.queue.lock().pop_front();
+            let work = wq.queue.lock_irqsave().pop_front();
             match work {
                 Some(w) => w.run(),
                 None => break,

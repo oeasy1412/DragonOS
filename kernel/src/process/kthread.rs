@@ -187,7 +187,10 @@ impl KernelThreadCreateInfo {
                     return self.result_pcb.lock().take();
                 }
                 KernelThreadCreateStatus::NotCreated => {
-                    spin_loop();
+                    // 对标 Linux kthread_create_on_node 使用 wait_for_completion：
+                    // spin_loop 忙等会阻止调度器切换到 kthreadd，导致死锁。
+                    // 必须调用 schedule() 让出 CPU，使 kthreadd 能处理创建请求。
+                    schedule(SchedMode::SM_NONE);
                 }
                 KernelThreadCreateStatus::ErrorOccured => {
                     // 创建失败，减少不安全的Arc引用计数
@@ -361,6 +364,11 @@ impl KernelThreadMechanism {
                 KTHREAD_DAEMON_PCB.replace(pcb);
             }
             info!("Initialize kernel thread mechanism stage2 complete");
+
+            // 对标 Linux rest_init(): 创建 kthreadd 后调用 schedule_preempt_disabled()，
+            // 让出 CPU 使 kthreadd 有机会运行并处理后续的 kthread_create 请求。
+            // 否则 do_initcalls() 中的 create_and_run() 会在 poll_result() 死锁。
+            schedule(SchedMode::SM_NONE);
         });
     }
 

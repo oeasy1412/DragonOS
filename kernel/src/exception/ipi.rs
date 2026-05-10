@@ -70,10 +70,11 @@ impl IrqHandler for KickCpuIpiHandler {
         let cpu = smp_get_processor_id();
         let rq = cpu_rq(cpu.data() as usize);
 
-        // 始终 rq_lock_irqsave 排空 wakelist。
-        // 若 try_lock 失败，任务留在 WakeQueue 中，由 scheduler_tick 或 __schedule 的
-        // switch_finish_hook 在下一次 rq lock 获取时排空。
-        if let Some((rq, _guard)) = rq.try_self_lock() {
+        // 始终在 rq lock 下排空 wakelist。
+        // IPI handler 运行在硬中断上下文，与本 CPU 的 rq lock 持有者（__schedule、
+        // scheduler_tick、load_balance 等）不可能并发，因此 self_lock() 不会死锁。
+        {
+            let (rq, _guard) = rq.self_lock();
             rq.update_rq_clock();
             rq.drain_wake_queue();
         }

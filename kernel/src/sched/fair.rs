@@ -1658,7 +1658,7 @@ impl Scheduler for CompletelyFairScheduler {
         unsafe { se.force_mut() }.deadline += se.calculate_delta_fair(se.slice);
     }
 
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<crate::process::ProcessControlBlock>,
         wake_flags: WakeupFlags,
@@ -1671,7 +1671,7 @@ impl Scheduler for CompletelyFairScheduler {
         assert_eq!(
             pse_cpu,
             rq.cpu(),
-            "check_preempt_currnet: cfs_rq mismatch! pid={:?} pse_cpu={:?} rq_cpu={:?} on_rq={:?}. \
+            "check_preempt_current: cfs_rq mismatch! pid={:?} pse_cpu={:?} rq_cpu={:?} on_rq={:?}. \
              Wakee's se.cfs_rq points to wrong CPU.",
             pcb.raw_pid(),
             pse_cpu,

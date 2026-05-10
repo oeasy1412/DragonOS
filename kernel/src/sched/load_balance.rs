@@ -8,9 +8,13 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::{collections::LinkedList, sync::Arc};
-use log::warn;
 
 use crate::{
+    arch::{
+        asm::irqflags::{local_irq_disable, local_irq_enable},
+        CurrentIrqArch,
+    },
+    exception::InterruptArch,
     libs::cpumask::CpuMask,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
     smp::{
@@ -77,15 +81,16 @@ impl LoadBalancer {
         prev_cpu: ProcessorId,
         wake_flags: u8,
     ) -> ProcessorId {
+        // select_task_rq：返回值保证是 cpus_allowed 中的有效 CPU。
+        let cpus_allowed = pcb.sched_info().cpus_allowed();
+        let current_cpu = smp_get_processor_id();
+
         // 如果负载均衡未启用，保持在原CPU（与原有行为一致）
         if !is_load_balance_enabled() {
-            return prev_cpu;
+            return Self::fallback_if_not_allowed(prev_cpu, prev_cpu, &cpus_allowed);
         }
 
-        let current_cpu = smp_get_processor_id();
         let cpu_manager = smp_cpu_manager();
-        let cpus_allowed = pcb.sched_info().cpus_allowed();
-
         if cpu_manager.present_cpus_count() <= 1 && cpus_allowed.get(current_cpu).unwrap_or(false) {
             return current_cpu;
         }
@@ -95,7 +100,8 @@ impl LoadBalancer {
             if let Some(cpu) = cpus_allowed.iter_cpu().next() {
                 return cpu;
             }
-            return prev_cpu;
+            // 空 cpus_allowed 是不变量违反，fallback 会 panic。
+            return Self::fallback_if_not_allowed(prev_cpu, prev_cpu, &cpus_allowed);
         }
 
         // WF_CURRENT_CPU：如果唤醒者请求将任务放到当前 CPU，优先满足
@@ -155,6 +161,11 @@ impl LoadBalancer {
     /// 如果选中的 CPU 不在任务允许掩码中，回退到 `prev_cpu`；
     /// 若 `prev_cpu` 也不允许，则在允许掩码中任选一个。
     /// 如果 `cpus_allowed` 为空（异常情况），返回当前 CPU 并记录警告。
+    /// 对标 Linux select_fallback_rq：
+    ///   - 若 target 允许，返回 target
+    ///   - 若 prev_cpu 允许，返回 prev_cpu
+    ///   - 否则在 cpus_allowed 中任选一个
+    ///   - 若 cpus_allowed 为空，panic（Linux BUG_ON）
     #[inline]
     fn fallback_if_not_allowed(
         target: ProcessorId,
@@ -170,11 +181,12 @@ impl LoadBalancer {
         if let Some(cpu) = cpus_allowed.iter_cpu().next() {
             return cpu;
         }
-        warn!(
-            "fallback_if_not_allowed: empty cpus_allowed, target={:?}, prev_cpu={:?}, defaulting to current CPU",
+        // 空 cpus_allowed 是不变量违反（任务必须至少有一个允许的 CPU）。
+        // 对标 Linux BUG_ON_ONCE(cpumask_empty(&p->cpus_allowed))。
+        panic!(
+            "select_task_rq: empty cpus_allowed for task, target={:?}, prev_cpu={:?}",
             target, prev_cpu
         );
-        smp_get_processor_id()
     }
 
     /// ## 找到负载最低的CPU（不加锁）
@@ -185,6 +197,10 @@ impl LoadBalancer {
         let mut idlest_cpu = fallback;
 
         for cpu in possible_cpus.iter_cpu() {
+            // 跳过不存在的 CPU（possible 但未 present 的 CPU 无有效 rq）
+            if !smp_cpu_manager().present_cpus().get(cpu).unwrap_or(false) {
+                continue;
+            }
             let rq = cpu_rq(cpu.data() as usize);
             let load = Self::get_rq_load_lockless(&rq);
 
@@ -198,7 +214,7 @@ impl LoadBalancer {
     }
 
     /// 负载估算
-    /// Linux 优先检查 sched_idle_cpu / available_idle_cpu，再比较 load_avg。
+    /// 优先检查 sched_idle_cpu / available_idle_cpu，再比较 load_avg。
     /// 优先使用 PELT load_avg；当 PELT 为 0 时回退到 nr_running，
     /// 避免系统刚启动时 PELT 全为 0 导致无法区分 CPU 的问题。
     #[inline]
@@ -245,15 +261,18 @@ impl LoadBalancer {
             return prev_cpu;
         }
         for cpu in cpus_allowed.iter_cpu() {
-            if cpu != target && Self::is_idle_cpu(cpu) {
+            if cpu != target
+                && cpu != prev_cpu
+                && Self::is_idle_cpu(cpu)
+                && smp_cpu_manager().present_cpus().get(cpu).unwrap_or(false)
+            {
                 return cpu;
             }
         }
         target
     }
 
-    /// 注意：Linux 使用 `sd_llc_size`（LLC 共享的 CPU 数量）作为 factor；
-    /// 当前实现使用 `present_cpus_count()` 代替，在 SMT 系统上阈值可能偏大。
+    /// 当前实现使用 `present_cpus_count()` 代替 factor，在 SMT 系统上阈值可能偏大。
     ///
     /// 当唤醒者与被唤醒者之间的唤醒链过宽时，返回 `true`，
     /// 提示调用者不要为了保持缓存亲和性而把任务留在原 CPU，
@@ -278,15 +297,6 @@ impl LoadBalancer {
         }
 
         true
-    }
-
-    /// ## 执行负载均衡
-    ///
-    /// 已弃用：周期性负载均衡逻辑已迁移至 `load_balance()`，
-    /// 由 `rebalance_domains()` 通过 workqueue 调用。
-    #[allow(dead_code)]
-    pub fn run_load_balance() {
-        // 实际负载均衡逻辑在 load_balance() 中实现
     }
 }
 
@@ -740,14 +750,16 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
 pub fn attach_tasks(dst_rq: &mut CpuRunQueue, env: &mut LbEnv) {
     while let Some(pcb) = env.tasks.pop_front() {
         dst_rq.activate_task(&pcb, EnqueueFlag::ENQUEUE_MIGRATED);
-        dst_rq.check_preempt_currnet(&pcb, super::WakeupFlags::empty());
+        dst_rq.check_preempt_current(&pcb, super::WakeupFlags::empty());
     }
 }
 
 /// 执行负载均衡。
+/// 1. 仅锁 busiest rq → detach_tasks → 释放 busiest rq 锁
+/// 2. 锁 dst rq → attach_tasks → 释放 dst rq 锁
 ///
-/// DragonOS 必须同时持有两把 rq 锁（detach+attach 在同一锁域内），
-/// 因为没有 TASK_ON_RQ_MIGRATING 保护机制
+/// 分离后任务处于 `OnRq::Migrating` 状态，不会并发入队，
+/// 因此释放 src_rq 锁后、获取 dst_rq 锁前，任务不会丢失。
 pub fn load_balance(
     cpu: ProcessorId,
     sd: &Arc<SchedDomain>,
@@ -778,7 +790,6 @@ pub fn load_balance(
     let group = match find_busiest_group(&mut env) {
         Some(g) => g,
         None => {
-            // out_balanced → out_all_pinned: nr_balance_failed = 0。
             sd.nr_balance_failed.store(0, Ordering::Relaxed);
             if idle != super::rebalance::CpuIdleType::NewlyIdle {
                 let cur = sd.balance_interval.load(Ordering::Relaxed);
@@ -793,7 +804,6 @@ pub fn load_balance(
     let busiest_cpu = match find_busiest_queue(&env, &group) {
         Some(cpu) => cpu,
         None => {
-            // out_balanced → out_all_pinned: Linux 两标签都执行 nr_balance_failed = 0。
             sd.nr_balance_failed.store(0, Ordering::Relaxed);
             if idle != super::rebalance::CpuIdleType::NewlyIdle {
                 let cur = sd.balance_interval.load(Ordering::Relaxed);
@@ -814,60 +824,47 @@ pub fn load_balance(
     env.flags |= LbfFlags::ALL_PINNED;
 
     let mut ld_moved: u32 = 0;
-    // DST_PINNED 重试上限：每次重试清除一个不可用的 dst_cpu，最多等于组内 CPU 数。
     let dst_pinned_limit = group.cpumask.iter_cpu().count();
     let mut dst_pinned_retries = 0;
 
     loop {
-        let (first_cpu, second_cpu) = if env.dst_cpu < busiest_cpu {
-            (env.dst_cpu, busiest_cpu)
-        } else {
-            (busiest_cpu, env.dst_cpu)
-        };
+        // rq_unlock 只释放 spinlock 不恢复 IRQ，确保 detach→attach 全程 IRQ 禁用。
+        // DragonOS SpinLockGuard::drop 会恢复 IRQ，因此需手动管理。
+        let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
+        local_irq_disable();
 
-        // 短路检查：自迁移无意义，且会对同一把 rq 锁自旋死锁。
-        if first_cpu == second_cpu {
-            break;
-        }
+        // self_lock_no_irq: 只获取 spinlock + preempt_disable，不动 IRQ 状态。
+        let src_rq_arc = cpu_rq(busiest_cpu.data() as usize);
+        let (src_rq, src_guard) = src_rq_arc.self_lock_no_irq();
+        src_rq.update_rq_clock();
 
-        let first_rq_arc = cpu_rq(first_cpu.data() as usize);
-        let second_rq_arc = cpu_rq(second_cpu.data() as usize);
-
-        let (mut first_rq, _g1) = first_rq_arc.self_lock();
-        if first_cpu == env.dst_cpu {
-            first_rq.update_rq_clock();
-        }
-
-        // 双锁顺序：低 CPU ID 先锁，防止 ABBA 死锁。
-        // first_cpu < second_cpu 由上面保证。
-        let (mut second_rq, _g2) = second_rq_arc.self_lock();
-        if second_cpu == env.dst_cpu {
-            second_rq.update_rq_clock();
-        }
-
-        let (src_rq, dst_rq) = if busiest_cpu == first_cpu {
-            (&mut first_rq, &mut second_rq)
-        } else {
-            (&mut second_rq, &mut first_rq)
-        };
-
-        // loop_max 在 src_rq 锁内计算，避免 TOCTOU。
         env.loop_max = src_rq
             .nr_running_lockless()
             .min(SCHED_NR_MIGRATE_BREAK as usize) as u32;
 
         let cur_ld_moved = detach_tasks(src_rq, &mut env);
 
+        // rq_unlock(busiest, &rf): 只释放 spinlock + preempt_enable，
+        // 不恢复 IRQ。任务此时处于 OnRq::Migrating，不会被并发激活。
+        drop(src_guard);
+
         if cur_ld_moved > 0 {
+            // rq_lock(dst) → attach_tasks → rq_unlock(dst)
+            // IRQ 仍然禁用
+            let dst_rq_arc = cpu_rq(env.dst_cpu.data() as usize);
+            let (dst_rq, dst_guard) = dst_rq_arc.self_lock_no_irq();
+            dst_rq.update_rq_clock();
             attach_tasks(dst_rq, &mut env);
+            drop(dst_guard);
             ld_moved += cur_ld_moved;
         }
 
-        drop(_g2);
-        drop(_g1);
+        // local_irq_restore(rf.flags): 全程 detach+attach 完成后恢复 IRQ。
+        if irq_was_enabled {
+            local_irq_enable();
+        }
 
-        // LBF_NEED_BREAK: DragonOS 缺少 TASK_ON_RQ_MIGRATING 保护，
-        // 释放锁后重新获取会导致 TOCTOU 竞态。不再重试。
+        // LBF_NEED_BREAK: 由于 detach/attach 已分离，可安全释放锁后重新获取。
         if env.flags.contains(LbfFlags::NEED_BREAK) {
             env.flags.remove(LbfFlags::NEED_BREAK);
         }
@@ -899,10 +896,8 @@ pub fn load_balance(
         sd.balance_interval
             .store(sd.min_interval.load(Ordering::Relaxed), Ordering::Relaxed);
     } else if env.flags.contains(LbfFlags::ALL_PINNED) {
-        // Linux: out_all_pinned → nr_balance_failed = 0; ld_moved = 0;
-        // out_one_pinned → if NewlyIdle goto out; else balance_interval *= 2
         sd.nr_balance_failed.store(0, Ordering::Relaxed);
-        if env.idle != super::rebalance::CpuIdleType::NewlyIdle {
+        if idle != super::rebalance::CpuIdleType::NewlyIdle {
             let max_pinned = 512u64;
             let cur = sd.balance_interval.load(Ordering::Relaxed);
             if cur < max_pinned {
@@ -910,7 +905,7 @@ pub fn load_balance(
             }
         }
     } else {
-        if env.idle != super::rebalance::CpuIdleType::NewlyIdle {
+        if idle != super::rebalance::CpuIdleType::NewlyIdle {
             sd.nr_balance_failed.fetch_add(1, Ordering::Relaxed);
         }
         sd.balance_interval
