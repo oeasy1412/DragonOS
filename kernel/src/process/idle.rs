@@ -79,7 +79,7 @@ impl ProcessManager {
             IDLE_CPUS.set(ProcessorId::new(i));
 
             // on_rq 和 on_cpu 在 __set_task_cpu 之后设置。
-            *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
+            idle_pcb.sched_info().on_rq.set(OnRq::Queued);
             idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
 
             v.push(idle_pcb);

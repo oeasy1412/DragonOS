@@ -94,7 +94,7 @@ impl Syscall for SysSchedSetaffinity {
             let (rq_ref, guard) = rq.self_lock();
             rq_ref.update_rq_clock();
 
-            *target_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Migrating;
+            target_pcb.sched_info().on_rq.set(OnRq::Migrating);
             rq_ref.dequeue_task(
                 target_pcb.clone(),
                 DequeueFlag::DEQUEUE_SAVE | DequeueFlag::DEQUEUE_NOCLOCK,
@@ -118,7 +118,7 @@ impl Syscall for SysSchedSetaffinity {
 
             // 获取 rq 锁后重新校验：task_cpu / on_rq / on_cpu 可能已变化。
             let current_cpu = task_cpu(&target_pcb);
-            let on_rq = *target_pcb.sched_info().on_rq.lock_irqsave();
+            let on_rq = target_pcb.sched_info().on_rq.get();
             let on_cpu = target_pcb.sched_info().on_cpu();
 
             if current_cpu != task_cpu_id {
@@ -131,7 +131,7 @@ impl Syscall for SysSchedSetaffinity {
 
             if on_rq == OnRq::Queued && on_cpu.is_none() {
                 // 任务在 rq 上排队且未运行，对标 Linux move_queued_task
-                *target_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Migrating;
+                target_pcb.sched_info().on_rq.set(OnRq::Migrating);
                 src_ref.dequeue_task(
                     target_pcb.clone(),
                     DequeueFlag::DEQUEUE_SAVE | DequeueFlag::DEQUEUE_NOCLOCK,

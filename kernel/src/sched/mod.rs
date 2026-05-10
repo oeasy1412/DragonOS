@@ -635,8 +635,8 @@ impl CpuRunQueue {
                 .contains(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD),
             "activate_task: SCHED_CONTRIBUTES_TO_LOAD must be cleared by caller"
         );
-        let mut on_rq_guard = pcb.sched_info().on_rq.lock_irqsave();
-        if *on_rq_guard == OnRq::Queued {
+        let on_rq_val = pcb.sched_info().on_rq.get();
+        if on_rq_val == OnRq::Queued {
             log::trace!(
                 "activate_task: pid={:?} already queued (race with parallel wakeup), skip",
                 pcb.raw_pid()
@@ -658,19 +658,19 @@ impl CpuRunQueue {
             return;
         }
 
-        if *on_rq_guard == OnRq::Migrating {
+        if on_rq_val == OnRq::Migrating {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
 
         self.enqueue_task(pcb.clone(), flags);
 
-        *on_rq_guard = OnRq::Queued;
+        pcb.sched_info().on_rq.set(OnRq::Queued);
 
         if was_idle_cpu && !rq_is_idle_cpu(self) {
             IDLE_CPUS.clear(self.cpu);
         }
 
-        debug_assert_eq!(*on_rq_guard, OnRq::Queued);
+        debug_assert_eq!(pcb.sched_info().on_rq.get(), OnRq::Queued);
         pcb.debug_assert_fork_cpu_binding();
     }
 
@@ -691,7 +691,7 @@ impl CpuRunQueue {
             self.resched_current();
         }
 
-        if *self.current_ref().sched_info().on_rq.lock_irqsave() == OnRq::Queued
+        if self.current_ref().sched_info().on_rq.get() == OnRq::Queued
             && self
                 .current_ref()
                 .flags()
@@ -737,7 +737,7 @@ impl CpuRunQueue {
             }
         }
 
-        if *self.current_ref().sched_info().on_rq.lock_irqsave() == OnRq::Queued
+        if self.current_ref().sched_info().on_rq.get() == OnRq::Queued
             && self
                 .current_ref()
                 .flags()
@@ -753,12 +753,13 @@ impl CpuRunQueue {
     /// **注意**：本函数不再处理 `nr_uninterruptible` 和 `nr_iowait` 计数。
     /// 调用方须在调用前/后根据任务状态自行维护这些计数器（参考 `__schedule` 中的处理逻辑）。
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
-        *pcb.sched_info().on_rq.lock_irqsave() =
+        pcb.sched_info().on_rq.set(
             if flags.intersects(DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_STOPPED) {
                 OnRq::None
             } else {
                 OnRq::Migrating
-            };
+            },
+        );
 
         self.dequeue_task(pcb, flags);
     }
@@ -812,7 +813,7 @@ impl CpuRunQueue {
             // 此时不能调用 __set_task_cpu，否则会破坏 cfs_rq 指针导致 dequeue mismatch。
             // activate_task 内部也有同样的 on_rq==Queued 早退，但我们必须在
             // __set_task_cpu 之前拦截，因为后者是无条件执行的。
-            if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+            if pcb.sched_info().on_rq.get() == OnRq::Queued {
                 log::trace!(
                     "drain_wake_queue: pid={:?} already queued, skip",
                     pcb.raw_pid()
@@ -1269,9 +1270,9 @@ bitflags! {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum OnRq {
-    Queued,
-    Migrating,
-    None,
+    None = 0,
+    Queued = 1,
+    Migrating = 2,
 }
 
 impl ProcessManager {
@@ -1692,7 +1693,7 @@ pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
         );
     }
 
-    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+    let on_rq = pcb.sched_info().on_rq.get();
     assert!(
         on_rq != OnRq::Queued,
         "__set_task_cpu called on pid={:?} with on_rq=Queued! \

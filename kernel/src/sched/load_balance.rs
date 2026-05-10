@@ -561,7 +561,7 @@ pub fn find_busiest_queue(env: &LbEnv, group: &SchedGroup) -> Option<ProcessorId
 fn can_migrate_task(pcb: &Arc<ProcessControlBlock>, env: &mut LbEnv) -> bool {
     let info = pcb.sched_info();
 
-    if *info.on_rq.lock_irqsave() != super::OnRq::Queued {
+    if info.on_rq.get() != super::OnRq::Queued {
         return false;
     }
 

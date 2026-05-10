@@ -1,4 +1,5 @@
 use core::{
+    cell::UnsafeCell,
     fmt,
     hash::Hash,
     hint::spin_loop,
@@ -382,14 +383,13 @@ impl ProcessManager {
                     let rq_arc = cpu_rq(rq_to_lock.data() as usize);
                     let (rq_ref, guard) = rq_arc.self_lock();
                     let current_cpu = task_cpu(pcb);
-                    if current_cpu != rq_to_lock
-                        || *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating
+                    if current_cpu != rq_to_lock || pcb.sched_info().on_rq.get() == OnRq::Migrating
                     {
                         drop(guard);
                         rq_to_lock = current_cpu;
                         continue;
                     }
-                    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+                    let on_rq = pcb.sched_info().on_rq.get();
                     if on_rq == OnRq::Queued {
                         rq_ref.update_rq_clock();
                         rq_ref.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
@@ -449,7 +449,7 @@ impl ProcessManager {
         let rq = cpu_rq(target_cpu.data() as usize);
         let (rq, _rq_guard) = rq.self_lock();
 
-        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        let on_rq = pcb.sched_info().on_rq.get();
         if on_rq == crate::sched::OnRq::Queued {
             let update_clock = target_cpu == smp_get_processor_id();
             if update_clock {
@@ -551,7 +551,7 @@ impl ProcessManager {
         let rq = cpu_rq(target_cpu.data() as usize);
         let (rq, _rq_guard) = rq.self_lock();
 
-        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        let on_rq = pcb.sched_info().on_rq.get();
         if on_rq == OnRq::Queued {
             let update_clock = target_cpu == smp_get_processor_id();
             if update_clock {
@@ -2503,6 +2503,34 @@ impl ProcessBasicInfo {
     }
 }
 
+/// 对标 Linux `task_struct::on_rq`（`unsigned int`）。
+/// 由 rq lock 保护的字段，写入须持有 rq lock，读取通常也在 rq lock 下进行。
+/// 使用 `UnsafeCell` + 手动 `Sync` impl 以避免 `SpinLock` 的 preempt_disable 开销。
+#[derive(Debug)]
+pub(crate) struct OnRqCell(UnsafeCell<OnRq>);
+
+impl OnRqCell {
+    const fn new(val: OnRq) -> Self {
+        Self(UnsafeCell::new(val))
+    }
+    #[inline(always)]
+    pub fn get(&self) -> OnRq {
+        unsafe { *self.0.get() }
+    }
+    #[inline(always)]
+    pub fn set(&self, val: OnRq) {
+        unsafe {
+            *self.0.get() = val;
+        }
+    }
+}
+
+// Safety: on_rq 的所有写入在 rq lock 保护下进行（与 Linux 一致）。
+// 读取也在 rq lock 下或通过 READ_ONCE 语义进行。
+// UnsafeCell 允许 &self 下的内部可变性，与 Linux 的 unsigned int + rq lock 模式等价。
+unsafe impl Sync for OnRqCell {}
+unsafe impl Send for OnRqCell {}
+
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
     /// 当前进程正在哪个 CPU 上执行（context_switch 时更新）
@@ -2524,7 +2552,8 @@ pub struct ProcessSchedulerInfo {
     pub sched_policy: RwLock<crate::sched::SchedPolicy>,
     /// cfs调度实体
     pub sched_entity: Arc<FairSchedEntity>,
-    pub on_rq: SpinLock<OnRq>,
+    /// 由 rq lock 保护的普通字段。
+    pub(crate) on_rq: OnRqCell,
     pub cpus_allowed: SpinLock<CpuMask>,
     pub nr_cpus_allowed: AtomicUsize,
 
@@ -2642,7 +2671,7 @@ impl ProcessSchedulerInfo {
             sched_stat: RwLock::new(SchedInfo::default()),
             sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
             sched_entity: FairSchedEntity::new(),
-            on_rq: SpinLock::new(OnRq::None),
+            on_rq: OnRqCell::new(OnRq::None),
             cpus_allowed: SpinLock::new(cpus_allowed),
             nr_cpus_allowed: AtomicUsize::new(nr_cpus_allowed),
             prio_data: RwLock::new(PrioData::default()),

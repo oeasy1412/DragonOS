@@ -1404,11 +1404,11 @@ impl CfsRunQueue {
 
     pub fn detach_task(&mut self, pcb: &Arc<ProcessControlBlock>, rq: &mut CpuRunQueue) {
         let se = pcb.sched_info().sched_entity();
+        pcb.sched_info().on_rq.set(OnRq::Migrating);
         self.dequeue_entity(&se, DequeueFlag::DEQUEUE_MOVE, rq);
         unsafe { se.force_mut() }.avg.last_update_time = 0;
         rq.sub_nr_running(1);
         pcb.sched_info().set_on_cpu(None);
-        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Migrating;
     }
 
     pub fn attach_task(&mut self, pcb: &Arc<ProcessControlBlock>, rq: &mut CpuRunQueue) {
@@ -1416,7 +1416,8 @@ impl CfsRunQueue {
         unsafe { se.force_mut() }.set_cfs(Arc::downgrade(&rq.cfs_rq()));
         self.enqueue_entity(&se, EnqueueFlag::ENQUEUE_MIGRATED, rq);
         rq.add_nr_running(1);
-        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
+        // 对标 Linux activate_task: enqueue 在前，on_rq=QUEUED 在后
+        pcb.sched_info().on_rq.set(OnRq::Queued);
     }
 }
 
@@ -1495,7 +1496,7 @@ impl Scheduler for CompletelyFairScheduler {
             pcb.raw_pid(),
             se.cfs_rq().rq().cpu(),
             rq.cpu(),
-            *pcb.sched_info().on_rq.lock_irqsave(),
+            pcb.sched_info().on_rq.get(),
         );
         let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
@@ -1568,7 +1569,7 @@ impl Scheduler for CompletelyFairScheduler {
             pcb.raw_pid(),
             se.cfs_rq().rq().cpu(),
             rq.cpu(),
-            *pcb.sched_info().on_rq.lock_irqsave(),
+            pcb.sched_info().on_rq.get(),
         );
         let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
         let task_sleep = flags.contains(DequeueFlag::DEQUEUE_SLEEP);
@@ -1676,7 +1677,7 @@ impl Scheduler for CompletelyFairScheduler {
             pcb.raw_pid(),
             pse_cpu,
             rq.cpu(),
-            *pcb.sched_info().on_rq.lock_irqsave(),
+            pcb.sched_info().on_rq.get(),
         );
 
         if unlikely(Arc::ptr_eq(&se, &pse)) {
