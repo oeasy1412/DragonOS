@@ -62,6 +62,7 @@ pub fn do_clone(
     clone_args.normalize_exit_signal();
     clone_args.verify()?;
     let flags = clone_args.flags;
+    let _parent_tid = clone_args.parent_tid;
 
     let vfork = Arc::new(Completion::new());
 

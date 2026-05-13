@@ -120,7 +120,7 @@ impl<T> SpinLock<T> {
     fn inner_try_lock(&self) -> bool {
         let res = self
             .lock
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok();
         return res;
     }
@@ -147,7 +147,7 @@ impl<T> SpinLock<T> {
     /// 由于这样做可能导致preempt count不正确，因此必须小心的手动维护好preempt count。
     /// 如非必要，请不要使用这个函数。
     pub unsafe fn force_unlock(&self) {
-        self.lock.store(false, Ordering::SeqCst);
+        self.lock.store(false, Ordering::Release);
     }
 
     fn unlock(&self) {
@@ -155,7 +155,7 @@ impl<T> SpinLock<T> {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lock.load(Ordering::SeqCst)
+        self.lock.load(Ordering::Relaxed)
     }
 }
 
