@@ -521,30 +521,6 @@ impl CfsRunQueue {
         slice
     }
 
-    /// ## 在时间片到期时检查当前任务是否需要被抢占，
-    /// 如果需要，则抢占当前任务，并确保不会由于与其他任务的“好友偏爱（buddy favours）”而重新选举为下一个运行的任务。
-    #[allow(dead_code)]
-    pub fn check_preempt_tick(&mut self, curr: Arc<FairSchedEntity>) {
-        // 计算理想状态下该调度实体的理想运行时间
-        let ideal_runtime = self.sched_slice(curr.clone());
-
-        let delta_exec = curr.sum_exec_runtime - curr.prev_sum_exec_runtime;
-
-        if delta_exec > ideal_runtime {
-            // 表明实际运行时间长于理想运行时间
-            self.rq().resched_current();
-
-            self.clear_buddies(&curr);
-            return;
-        }
-
-        if delta_exec < SYSCTL_SHCED_MIN_GRANULARITY.load(Ordering::SeqCst) {
-            return;
-        }
-
-        todo!()
-    }
-
     pub fn clear_buddies(&mut self, se: &Arc<FairSchedEntity>) {
         if let Some(next) = self.next.upgrade() {
             if Arc::ptr_eq(&next, se) {
@@ -1443,7 +1419,6 @@ impl CfsRunQueue {
         self.dequeue_entity(&se, DequeueFlag::DEQUEUE_MOVE, rq);
         unsafe { se.force_mut() }.avg.last_update_time = 0;
         rq.sub_nr_running(1);
-        pcb.sched_info().set_on_cpu(None);
     }
 
     pub fn attach_task(&mut self, pcb: &Arc<ProcessControlBlock>, rq: &mut CpuRunQueue) {

@@ -17,6 +17,7 @@ use crate::{
     exception::InterruptArch,
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
+    process::preempt::{preempt_count_val, set_preempt_count_val},
     process::ProcessManager,
     sched::cputime::IrqTime,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
@@ -213,17 +214,17 @@ impl Softirq {
                         continue;
                     }
 
-                    let prev_count: usize = ProcessManager::current_pcb().preempt_count();
+                    let prev_count: usize = preempt_count_val();
 
                     softirq_func.as_ref().unwrap().run();
-                    if unlikely(prev_count != ProcessManager::current_pcb().preempt_count()) {
+                    if unlikely(prev_count != preempt_count_val()) {
                         debug!(
                             "entered softirq {:?} with preempt_count {:?},exited with {:?}",
                             i,
                             prev_count,
-                            ProcessManager::current_pcb().preempt_count()
+                            preempt_count_val()
                         );
-                        unsafe { ProcessManager::current_pcb().set_preempt_count(prev_count) };
+                        set_preempt_count_val(prev_count);
                     }
                 }
             }

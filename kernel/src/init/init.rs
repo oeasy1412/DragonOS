@@ -49,6 +49,10 @@ pub fn start_kernel() -> ! {
 
     CurrentSchedArch::enable_sched_local();
 
+    // per-CPU preempt_count 会累积 boot 过程中其他代码路径的不平衡，
+    // 对标 AP smp_ap_start_stage2 中的重置逻辑，在进入 idle 循环前归零。
+    crate::process::preempt::set_preempt_count_val(0);
+
     ProcessManager::arch_idle_func();
 }
 

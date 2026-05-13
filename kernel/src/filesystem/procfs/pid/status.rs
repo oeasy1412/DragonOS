@@ -125,11 +125,6 @@ impl StatusFileOps {
         pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
         pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npreempt:\t{}", pcb.preempt_count())
-                .as_bytes()
-                .to_owned(),
-        );
 
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 

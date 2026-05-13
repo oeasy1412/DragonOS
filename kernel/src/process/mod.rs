@@ -874,13 +874,17 @@ impl ProcessManager {
             ProcessManager::exit_notify();
         }
 
+        // 对标 Linux do_exit → do_task_dead：
+        //   do_task_dead() 直接调用 __schedule(SM_NONE) 不做 preempt_disable，
+        //   但 DragonOS 的 switch_process 通过 set_preempt_count_val(0) 归零，
+        //   因此这里必须先 preempt_disable，否则 rq lock 获取时 count 会多加 1。
         // 由 __schedule 在看到 Exited 状态时统一调用 deactivate_task。
-        __schedule(SchedMode::SM_NONE);
-        error!("raw_pid {raw_pid:?} exited but sched again!");
-        #[allow(clippy::empty_loop)]
-        loop {
-            spin_loop();
+        ProcessManager::preempt_disable();
+        let switched = __schedule(SchedMode::SM_NONE);
+        if !switched {
+            ProcessManager::preempt_enable();
         }
+        panic!("raw_pid {raw_pid:?} exited but __schedule returned without switching!");
     }
 
     /// 线程组整体退出（仿照 Linux do_group_exit 语义）
@@ -1012,7 +1016,16 @@ impl ProcessManager {
 
     /// 上下文切换完成后的钩子函数
     unsafe fn switch_finish_hook() {
-        // debug!("switch_finish_hook");
+        let count = preempt::preempt_count_val();
+        if unlikely(count != 0) {
+            log::error!(
+                "corrupted preempt_count after context switch: cpu={} count={} (expected 0)",
+                smp_get_processor_id().data(),
+                count
+            );
+            preempt::set_preempt_count_val(0);
+        }
+
         let prev_pcb = PROCESS_SWITCH_RESULT
             .as_mut()
             .unwrap()
@@ -1066,7 +1079,7 @@ impl ProcessManager {
     /// - `pcb` : 进程的pcb
     #[allow(dead_code)]
     pub fn kick(pcb: &Arc<ProcessControlBlock>) {
-        ProcessManager::current_pcb().preempt_disable();
+        ProcessManager::preempt_disable();
         let cpu_id = pcb.sched_info().on_cpu();
 
         if let Some(cpu_id) = cpu_id {
@@ -1085,7 +1098,7 @@ impl ProcessManager {
             }
         }
 
-        ProcessManager::current_pcb().preempt_enable();
+        ProcessManager::preempt_enable();
     }
 }
 
@@ -1245,7 +1258,10 @@ bitflags! {
 
 impl ProcessFlags {
     pub const fn exit_to_user_mode_work(&self) -> Self {
-        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits))
+        Self::from_bits_truncate(
+            self.bits
+                & (Self::NEED_SCHEDULE.bits | Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits),
+        )
     }
 
     /// 测试并清除标志位
@@ -1299,8 +1315,6 @@ pub struct ProcessControlBlock {
     nsproxy: RwLock<Arc<NsProxy>>,
 
     basic: RwLock<ProcessBasicInfo>,
-    /// 当前进程的自旋锁持有计数
-    preempt_count: AtomicUsize,
     /// 自愿上下文切换次数（进程主动调用 schedule / mark_sleep 等放弃 CPU）
     nvcsw: AtomicUsize,
     /// 非自愿上下文切换次数（进程被抢占，如时间片用完、更高优先级任务就绪）
@@ -1461,7 +1475,6 @@ impl ProcessControlBlock {
         };
 
         let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
-        let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
         let sched_info = ProcessSchedulerInfo::new(None);
@@ -1481,7 +1494,6 @@ impl ProcessControlBlock {
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RwLock::new(nsproxy),
                 basic: basic_info,
-                preempt_count,
                 nvcsw: AtomicUsize::new(0),
                 nivcsw: AtomicUsize::new(0),
                 flags,
@@ -1677,29 +1689,6 @@ impl ProcessControlBlock {
         let fd_table = self.basic.read().try_fd_table().unwrap();
         let mut fd_table_guard = fd_table.write();
         fd_table_guard.adjust_for_rlimit_change(new_rlimit_nofile)
-    }
-
-    /// 返回当前进程的锁持有计数
-    #[inline(always)]
-    pub fn preempt_count(&self) -> usize {
-        return self.preempt_count.load(Ordering::SeqCst);
-    }
-
-    /// 增加当前进程的锁持有计数
-    #[inline(always)]
-    pub fn preempt_disable(&self) {
-        self.preempt_count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// 减少当前进程的锁持有计数
-    #[inline(always)]
-    pub fn preempt_enable(&self) {
-        self.preempt_count.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    #[inline(always)]
-    pub unsafe fn set_preempt_count(&self, count: usize) {
-        self.preempt_count.store(count, Ordering::SeqCst);
     }
 
     #[inline]

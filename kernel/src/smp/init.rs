@@ -3,7 +3,7 @@ use log::info;
 use crate::{
     arch::{syscall::arch_syscall_init, CurrentIrqArch, CurrentSchedArch},
     exception::InterruptArch,
-    process::ProcessManager,
+    process::{preempt, ProcessManager},
     sched::SchedArch,
     smp::{core::smp_get_processor_id, cpu::smp_cpu_manager},
 };
@@ -21,6 +21,11 @@ pub fn smp_ap_start_stage2() -> ! {
     CurrentSchedArch::initial_setup_sched_local();
 
     CurrentSchedArch::enable_sched_local();
+
+    // per-CPU preempt_count 会累积 boot 过程中其他代码路径的不平衡，
+    // 对标 BSP do_cpuhp_kick_ap 中的重置逻辑，在进入 idle 循环前归零。
+    preempt::set_preempt_count_val(0);
+
     ProcessManager::arch_idle_func();
 }
 

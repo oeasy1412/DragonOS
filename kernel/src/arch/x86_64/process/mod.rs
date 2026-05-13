@@ -436,17 +436,17 @@ impl ProcessManager {
 
         (*prev_arch).rip = switch_back as usize;
 
-        // preempt_count 平衡：context switch 路径中共有 3 次 preempt_disable，
+        // preempt_count 平衡：context switch 路径中共有 4 次 preempt_disable，
         // 全部发生在 prev (current) 上：
+        //   0. schedule() preempt_disable
         //   1. __schedule self_lock_no_irq → try_lock → preempt_disable
         //   2. prev.arch_info_irqsave → lock_irqsave → preempt_disable
         //   3. next.arch_info_irqsave → lock_irqsave → preempt_disable
-        // 3 个 guard 全部被 leak，后续由 force_unlock 释放锁但不做 preempt_enable。
-        // 因此在 context switch 前（仍在 prev 栈上）用 3 次 preempt_enable 对消。
-        // switch_finish_hook 中不需要再做 preempt_enable。
-        ProcessManager::current_pcb().preempt_enable();
-        ProcessManager::current_pcb().preempt_enable();
-        ProcessManager::current_pcb().preempt_enable();
+        // guard 0 被 mem::forget 泄漏；guard 1,2 被 SpinLockGuard::leak 泄漏。
+        // 后续由 force_unlock 释放锁但不做 preempt_enable。
+        //
+        // DragonOS 使用 set_preempt_count_val 一次性归零
+        crate::process::preempt::set_preempt_count_val(0);
 
         // 切换tss
         TSSManager::current_tss().set_rsp(

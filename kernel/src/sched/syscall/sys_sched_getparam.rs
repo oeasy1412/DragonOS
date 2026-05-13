@@ -78,9 +78,15 @@ impl Syscall for SysSchedGetparam {
         }
 
         // 获取调度策略和优先级
-        let policy = *target_pcb.sched_info().sched_policy.read_irqsave();
-        let prio_data = target_pcb.sched_info().prio_data.read_irqsave();
-        let prio = prio_data.prio;
+        // 注意：需要明确控制 guard 的生命周期，确保 preempt_disable/enable 配对
+        let policy = {
+            let guard = target_pcb.sched_info().sched_policy.read_irqsave();
+            *guard
+        };
+        let prio = {
+            let guard = target_pcb.sched_info().prio_data.read_irqsave();
+            guard.prio
+        };
 
         // 根据调度策略计算 sched_priority
         // Linux 行为：

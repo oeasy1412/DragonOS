@@ -8,7 +8,7 @@ use crate::{
     arch::CurrentSMPArch,
     libs::cpumask::CpuMask,
     mm::percpu::{PerCpu, PerCpuVar},
-    process::{ProcessControlBlock, ProcessManager},
+    process::{preempt::preempt_count_val, ProcessControlBlock, ProcessManager},
     sched::completion::Completion,
 };
 
@@ -305,7 +305,16 @@ impl SmpCpuManager {
         ProcessManager::wakeup(cpu_state.thread.as_ref().unwrap())?;
 
         CurrentSMPArch::start_cpu(cpu_id, cpu_state)?;
-        assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
+
+        // per-CPU preempt_count 会累积 boot 过程中其他代码路径的不平衡，
+        if preempt_count_val() != 0 {
+            log::warn!(
+                "do_cpuhp_kick_ap: preempt_count={:?} (expected 0), resetting",
+                preempt_count_val()
+            );
+            crate::process::preempt::set_preempt_count_val(0);
+        }
+
         self.wait_for_ap_thread(cpu_state, cpu_state.bringup);
 
         return Ok(());

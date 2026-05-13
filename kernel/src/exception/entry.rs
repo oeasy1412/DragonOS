@@ -2,6 +2,7 @@ use crate::{
     arch::{interrupt::TrapFrame, CurrentSignalArch},
     ipc::signal_types::SignalArch,
     process::{rseq::Rseq, ProcessFlags, ProcessManager},
+    sched::{schedule, SchedMode},
 };
 
 #[no_mangle]
@@ -38,15 +39,21 @@ unsafe fn exit_to_user_mode_prepare(frame: &mut TrapFrame) {
 /// 必须保证所有的栈上的Arc/Box指针等，都已经被释放。否则，可能会导致内存泄漏。
 unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: ProcessFlags) {
     while !process_flags_work.exit_to_user_mode_work().is_empty() {
-        // 优先处理 rseq，因为信号递送会保存 trapframe 到 sigframe
-        // rseq 的 IP fixup 必须在信号递送之前完成
+        // NEED_SCHEDULE：调度优先级最高
+        if process_flags_work.contains(ProcessFlags::NEED_SCHEDULE) {
+            schedule(SchedMode::SM_NONE);
+        }
+
+        // HAS_PENDING_SIGNAL：信号递送会修改 trapframe
+        if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL) {
+            unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
+        }
+
+        // NEED_RSEQ：可重入序列可以在最后处理
         if process_flags_work.contains(ProcessFlags::NEED_RSEQ) {
             let _ = Rseq::handle_notify_resume(Some(frame));
         }
 
-        if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL) {
-            unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
-        }
         process_flags_work = *ProcessManager::current_pcb().flags();
     }
 }

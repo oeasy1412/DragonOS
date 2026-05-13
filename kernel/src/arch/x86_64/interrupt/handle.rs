@@ -1,13 +1,14 @@
 use core::intrinsics::likely;
 
 use crate::{
-    arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
-    exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
+    arch::driver::apic::{CurrentApic, LocalAPIC},
+    arch::CurrentIrqArch,
+    exception::{irqdesc::irq_desc_manager, softirq::do_softirq, InterruptArch, IrqNumber},
     process::{
         utils::{current_pcb_flags, current_pcb_preempt_count},
-        ProcessFlags,
+        ProcessFlags, ProcessManager,
     },
-    sched::{SchedMode, __schedule},
+    sched::{need_resched, SchedMode, __schedule},
 };
 
 use super::TrapFrame;
@@ -41,10 +42,20 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     if current_pcb_preempt_count() > 0 {
         return;
     }
-    // 检测当前进程是否可被调度
-    if (current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE))
-        || vector == APIC_TIMER_IRQ_NUM.data()
-    {
-        __schedule(SchedMode::SM_PREEMPT);
+
+    // 仅当 NEED_SCHEDULE 被设置时才调用 __schedule，
+    if current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE) {
+        loop {
+            ProcessManager::preempt_disable();
+            unsafe { CurrentIrqArch::interrupt_enable() };
+            let switched = __schedule(SchedMode::SM_PREEMPT);
+            unsafe { CurrentIrqArch::interrupt_disable() };
+            if !switched {
+                ProcessManager::preempt_enable();
+            }
+            if !need_resched() {
+                break;
+            }
+        }
     }
 }

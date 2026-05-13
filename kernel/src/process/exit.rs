@@ -621,7 +621,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
                         let child_pgrp = pcb.task_pgrp();
                         let in_target_pgrp = match &child_pgrp {
-                            Some(cp) => Arc::ptr_eq(cp, pgid),
+                            Some(cp) => cp == pgid,
                             None => false,
                         };
                         if !in_target_pgrp {
@@ -748,7 +748,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
                             let child_pgrp = pcb.task_pgrp();
                             let in_target_pgrp = match &child_pgrp {
-                                Some(cp) => Arc::ptr_eq(cp, pgid),
+                                Some(cp) => cp == pgid,
                                 None => false,
                             };
                             if !in_target_pgrp {

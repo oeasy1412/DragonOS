@@ -26,7 +26,9 @@ use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
     libs::mutex::MutexGuard,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{
+        preempt::preempt_count_val, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState,
+    },
     sched::{io_schedule, schedule, SchedMode},
     time::{
         timer::{next_n_us_timer_jiffies, Timer},
@@ -809,11 +811,11 @@ enum WakerSleepState {
 
 fn before_sleep_check(max_preempt: usize) {
     let pcb = ProcessManager::current_pcb();
-    if unlikely(pcb.preempt_count() > max_preempt) {
+    if unlikely(preempt_count_val() > max_preempt) {
         warn!(
             "Process {:?}: Try to sleep when preempt count is {}",
             pcb.raw_pid().data(),
-            pcb.preempt_count()
+            preempt_count_val()
         );
     }
 }

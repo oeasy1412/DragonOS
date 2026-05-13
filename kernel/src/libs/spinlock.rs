@@ -152,7 +152,6 @@ impl<T> SpinLock<T> {
 
     fn unlock(&self) {
         self.lock.store(false, Ordering::SeqCst);
-        ProcessManager::preempt_enable();
     }
 
     pub fn is_locked(&self) -> bool {
@@ -180,8 +179,9 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.unlock();
-        // restore irq
+        // 先恢复中断，再启用抢占
         self.irq_flag.take();
+        ProcessManager::preempt_enable();
     }
 }
 

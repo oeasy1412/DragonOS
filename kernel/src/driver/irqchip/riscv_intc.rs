@@ -3,19 +3,13 @@ use log::error;
 use system_error::SystemError;
 
 use crate::{
-    arch::interrupt::TrapFrame,
-    driver::clocksource::timer_riscv::{riscv_sbi_timer_irq_desc_init, RiscVSbiTimer},
+    arch::CurrentIrqArch,
     exception::{
-        handle::PerCpuDevIdIrqHandler,
-        irqchip::{IrqChip, IrqChipFlags},
-        irqdata::IrqData,
-        irqdesc::{irq_desc_manager, GenericIrqHandler},
-        irqdomain::{irq_domain_manager, IrqDomain, IrqDomainOps},
-        softirq::do_softirq,
-        HardwareIrqNumber, IrqNumber,
+        softirq::do_softirq, GenericIrqHandler, HardwareIrqNumber, InterruptArch, IrqNumber,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    sched::{SchedMode, __schedule},
+    process::{preempt::preempt_count_val, ProcessManager},
+    sched::{need_resched, SchedMode, __schedule},
 };
 
 use super::riscv_sifive_plic::do_plic_irq;
@@ -224,7 +218,26 @@ pub fn riscv_intc_irq(trap_frame: &mut TrapFrame) {
         .ok();
     }
     do_softirq();
-    if hwirq.data() == RiscVSbiTimer::TIMER_IRQ.data() {
-        __schedule(SchedMode::SM_PREEMPT);
+
+    if preempt_count_val() > 0 {
+        return;
+    }
+
+    // 仅当 NEED_SCHEDULE 被设置时才调用 __schedule，
+    if !need_resched() {
+        return;
+    }
+
+    loop {
+        ProcessManager::preempt_disable();
+        unsafe { CurrentIrqArch::interrupt_enable() };
+        let switched = __schedule(SchedMode::SM_PREEMPT);
+        unsafe { CurrentIrqArch::interrupt_disable() };
+        if !switched {
+            ProcessManager::preempt_enable();
+        }
+        if !need_resched() {
+            break;
+        }
     }
 }

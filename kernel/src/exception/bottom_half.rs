@@ -17,26 +17,26 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use system_error::SystemError;
 
-use alloc::vec::Vec;
-
 use crate::{
     arch::CurrentIrqArch,
     exception::{softirq, tasklet, InterruptArch},
-    mm::percpu::{PerCpu, PerCpuVar},
+    mm::percpu::PerCpu,
+    smp::core::smp_get_processor_id,
 };
 
-lazy_static! {
-    /// 每个 CPU 的 BH 禁用计数
-    static ref BH_DISABLE_COUNT: PerCpuVar<AtomicUsize> = {
-        let mut v = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
-        v.resize_with(PerCpu::MAX_CPU_NUM as usize, || AtomicUsize::new(0));
-        PerCpuVar::new(v).expect("PerCpuVar length mismatch")
-    };
-}
+/// SOFTIRQ 域：per-CPU 静态数组，零堆分配。
+static BH_DISABLE_COUNT: [AtomicUsize; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicUsize::new(0) }; PerCpu::MAX_CPU_NUM as usize];
 
 #[inline(always)]
 fn local_cnt() -> &'static AtomicUsize {
-    BH_DISABLE_COUNT.get()
+    let cpu = smp_get_processor_id().data() as usize;
+    debug_assert!(
+        cpu < BH_DISABLE_COUNT.len(),
+        "local_cnt: CPU ID {} out of bounds",
+        cpu
+    );
+    unsafe { BH_DISABLE_COUNT.get_unchecked(cpu) }
 }
 
 /// 返回本 CPU 是否允许执行 softirq/tasklet（bottom half）。

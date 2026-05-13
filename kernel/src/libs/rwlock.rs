@@ -629,6 +629,8 @@ impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
+        // 先恢复中断，再启用抢占
+        self.irq_guard.take();
         ProcessManager::preempt_enable();
     }
 }
@@ -640,6 +642,8 @@ impl<T> Drop for RwLockUpgradableGuard<'_, T> {
             UPGRADED
         );
         self.inner.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
+        // 先恢复中断，再启用抢占
+        self.irq_guard.take();
         ProcessManager::preempt_enable();
         //这里为啥要AcqRel? Release应该就行了?
     }
@@ -651,6 +655,7 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
         self.inner
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+        // 先恢复中断，再启用抢占
         self.irq_guard.take();
         ProcessManager::preempt_enable();
     }

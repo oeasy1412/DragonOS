@@ -91,6 +91,7 @@ pub fn kernel_catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, SystemError> 
         Ok(r) => Ok(r),
         Err(e) => {
             log::error!("Catch Unwind Error: {:?}", e);
+            crate::process::preempt::set_preempt_count_val(0);
             Err(SystemError::MAXERRNO)
         }
     }

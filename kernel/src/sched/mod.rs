@@ -839,17 +839,29 @@ impl CpuRunQueue {
                 continue;
             }
 
-            // 对标 Linux sched_ttwu_pending() core.c:3884:
-            //   if (WARN_ON_ONCE(p->on_cpu))
-            //       smp_cond_load_acquire(&p->on_cpu, !VAL);
-            // 正常情况下 IPI 在 finish_task() 清除 on_cpu 之后才到达，
-            // 因此 on_cpu 不应为 Some。若 on_cpu 一直未清除说明内核存在严重 bug
-            //（context switch 未完成），无限自旋以保持 rq lock 语义一致性。
-            if pcb.sched_info().on_cpu().is_some() {
+            let on_cpu = pcb.sched_info().on_cpu();
+            if on_cpu == Some(cpu) {
+                // 这个任务的 on_cpu 指向当前 CPU。
+                // 检查它是否就是 rq 的 current task（即正在运行的任务）。
+                // 如果是，说明 wakelist 入队发生在 __schedule pick 之前，
+                // 该任务已经被 activate + schedule in，这是一个 stale entry。
+                if Arc::ptr_eq(&pcb, self.current.as_ref().unwrap()) {
+                    log::debug!(
+                        "drain_wake_queue: pid={:?} is current task on this rq, skip stale entry",
+                        pcb.raw_pid()
+                    );
+                    continue;
+                }
+                // 不是 current 但 on_cpu == Some(this_cpu)：不应该发生，
+                // 因为同一 CPU 上同一时刻只有一个任务的 on_cpu==Some。
                 log::warn!(
-                    "drain_wake_queue: pid={:?} on_cpu is Some, waiting for context switch to complete",
+                    "drain_wake_queue: pid={:?} on_cpu==Some(this_cpu) but not current, waiting",
                     pcb.raw_pid()
                 );
+            }
+
+            // on_cpu 指向其他 CPU：等待远程 CPU 完成 context switch。
+            if on_cpu.is_some() {
                 let mut spins = 0u64;
                 while pcb.sched_info().on_cpu().is_some() {
                     fence(Ordering::Acquire);
@@ -1368,7 +1380,7 @@ fn trigger_load_balance(rq: &CpuRunQueue) -> Option<(ProcessorId, rebalance::Cpu
 
 /// 检查当前进程是否被标记需要重新调度。
 #[inline(always)]
-fn need_resched() -> bool {
+pub fn need_resched() -> bool {
     ProcessManager::current_pcb()
         .flags()
         .contains(ProcessFlags::NEED_SCHEDULE)
@@ -1380,9 +1392,11 @@ fn need_resched() -> bool {
 #[inline]
 pub fn schedule(sched_mod: SchedMode) {
     loop {
-        ProcessManager::current_pcb().preempt_disable();
-        __schedule(sched_mod);
-        ProcessManager::current_pcb().preempt_enable();
+        ProcessManager::preempt_disable();
+        let switched = __schedule(sched_mod);
+        if !switched {
+            ProcessManager::preempt_enable();
+        }
         if !need_resched() {
             break;
         }
@@ -1410,7 +1424,9 @@ pub fn io_schedule() {
 /// ## 执行调度
 /// 此函数与schedule的区别为，该函数不会检查preempt_count
 /// 适用于时钟中断等场景
-pub fn __schedule(sched_mod: SchedMode) {
+/// 返回 true 表示发生了 context switch（preempt_count 已由 switch_finish_hook 释放），
+/// 返回 false 表示 same-task 路径（preempt_count 仍需调用方 preempt_enable）。
+pub fn __schedule(sched_mod: SchedMode) -> bool {
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
 
@@ -1591,6 +1607,7 @@ pub fn __schedule(sched_mod: SchedMode) {
         core::mem::forget(guard);
 
         unsafe { ProcessManager::switch_process(prev, next) };
+        true
     } else {
         drop(guard);
         if irq_was_enabled {
@@ -1601,6 +1618,7 @@ pub fn __schedule(sched_mod: SchedMode) {
             "{}",
             ProcessManager::current_pcb().basic().name()
         );
+        false
     }
 }
 
@@ -1664,6 +1682,13 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
         );
         target_cpu
     };
+    // __set_task_cpu 之前，确保并发观察者先看到 TASK_RUNNING 再看到 CPU 迁移。
+    {
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        writer.set_state(ProcessState::Runnable);
+        writer.set_wakeup();
+    }
+
     let target_cpu = if target_cpu == ProcessorId::INVALID {
         log::error!(
             "wake_up_new_task: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
@@ -1674,13 +1699,6 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
         target_cpu
     };
     __set_task_cpu(pcb, target_cpu);
-
-    // 设置进程状态为 Runnable（WRITE_ONCE(p->__state, TASK_RUNNING)）
-    {
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        writer.set_state(ProcessState::Runnable);
-        writer.set_wakeup();
-    }
 
     let current_cpu = smp_get_processor_id();
     if target_cpu == current_cpu {
