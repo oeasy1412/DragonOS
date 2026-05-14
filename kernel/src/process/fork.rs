@@ -27,7 +27,6 @@ use crate::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager_initialized, ProcessorId},
     },
-
     syscall::user_access::UserBufferWriter,
 };
 

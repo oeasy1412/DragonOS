@@ -90,7 +90,6 @@ unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     debug!("smp_ap_start_stage1: id: {}\n", id.data());
     X86_64MMArch::init_current_cpu_nxe();
 
-
     let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 
     let tss = TSSManager::current_tss();
