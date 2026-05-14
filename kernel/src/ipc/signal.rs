@@ -358,7 +358,7 @@ impl Signal {
 
         // 若线程正处于可中断阻塞，且当前在 set_user_sigmask 语义下（如 rt_sigtimedwait/pselect 等）
         // 则无论该信号是否在常规 blocked 集内，都应唤醒，由具体系统调用在返回路径上判定。
-        let state = pcb.sched_info().inner_lock_read_irqsave().state();
+        let state = pcb.sched_info().state();
 
         // SIGCONT：即便被屏蔽或默认忽略，也应唤醒处于 Stopped 的任务，让其继续运行。
         if *self == Signal::SIGCONT && state.is_stopped() {
@@ -544,7 +544,7 @@ impl Signal {
 
             // 仅当确实处于 job-control stopped 时，才报告 continued 事件并通知父进程
             let was_stopped = {
-                let state = pcb.sched_info().inner_lock_read_irqsave().state();
+                let state = pcb.sched_info().state();
                 state.is_stopped()
                     || pcb.sighand().flags_contains(SignalFlags::STOP_STOPPED)
                     || pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
@@ -603,7 +603,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // debug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
-    let state = pcb.sched_info().inner_lock_read_irqsave().state();
+    let state = pcb.sched_info().state();
     let mut wakeup_ok = true;
     if state.is_blocked_interruptable() {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {

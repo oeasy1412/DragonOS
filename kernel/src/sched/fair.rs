@@ -1842,7 +1842,7 @@ impl Scheduler for CompletelyFairScheduler {
         let prev_cfs_valid = if let Some(p) = &prev {
             if p.sched_info().policy() == SchedPolicy::CFS {
                 // Check if prev is still running (not blocked)
-                let state = p.sched_info().inner_lock_read_irqsave().state();
+                let state = p.sched_info().state();
                 state.is_runnable()
             } else {
                 false
@@ -1900,12 +1900,7 @@ impl Scheduler for CompletelyFairScheduler {
                     // 防御性检查：已退出任务不得被选中。
                     // Linux 通过 TASK_DEAD 阻止 try_to_wake_up 重新入队；
                     // DragonOS 加最后一道防线，防止 cfs_rq 不一致导致选中已退出任务。
-                    if pcb
-                        .sched_info()
-                        .inner_lock_read_irqsave()
-                        .state()
-                        .is_exited()
-                    {
+                    if pcb.sched_info().state().is_exited() {
                         log::error!(
                             "pick_next_task: selected exited task {:?}, this indicates cfs_rq corruption",
                             pcb.raw_pid()

@@ -74,7 +74,7 @@ impl Syscall for SysSchedSetaffinity {
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             let cur_cpu = smp_get_processor_id();
 
-            let mut pi_guard = target_pcb.sched_info().inner_lock_write_irqsave();
+            let mut pi_guard = target_pcb.sched_info().pi_lock_irqsave();
             pi_guard.set_cpus_allowed(mask.clone());
 
             let needs_migration = mask.get(cur_cpu) != Some(true);
@@ -106,6 +106,7 @@ impl Syscall for SysSchedSetaffinity {
                 DequeueFlag::DEQUEUE_SAVE | DequeueFlag::DEQUEUE_NOCLOCK,
             );
             if dest_cpu != cur_cpu {
+                __set_task_cpu(&target_pcb, dest_cpu);
                 ttwu_queue(&target_pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
             }
 
@@ -119,7 +120,7 @@ impl Syscall for SysSchedSetaffinity {
 
             // 只负责获取 pi_lock + rq_lock 并验证任务未迁移，retry 时不重复设 mask。
             'task_rq_lock: loop {
-                let mut pi_guard = target_pcb.sched_info().inner_lock_write_irqsave();
+                let mut pi_guard = target_pcb.sched_info().pi_lock_irqsave();
 
                 let task_cpu_id = task_cpu(&target_pcb);
                 let src_rq = cpu_rq(task_cpu_id.data() as usize);

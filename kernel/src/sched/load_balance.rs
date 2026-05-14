@@ -16,7 +16,8 @@ use crate::{
     },
     exception::InterruptArch,
     libs::cpumask::CpuMask,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    libs::spinlock::SpinLockGuard,
+    process::{PiProtected, ProcessControlBlock, ProcessFlags, ProcessManager},
     smp::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager, ProcessorId},
@@ -71,19 +72,20 @@ fn is_load_balance_enabled() -> bool {
 pub struct LoadBalancer;
 
 impl LoadBalancer {
-    /// 选择任务唤醒时的目标CPU
+    /// 选择任务唤醒时的目标 CPU。目前处理 cpus_allowed 掩码、WF_CURRENT_CPU、
+    /// 粗略负载比较以及 wake_affine，尚未实现 LLC 域扫描及 sched_domain 层级逻辑。
     ///
-    /// 这个函数在任务被唤醒时调用，用于选择最适合运行该任务的CPU。
-    /// 目前处理 cpus_allowed 掩码、WF_CURRENT_CPU、粗略负载比较以及 wake_affine，
-    /// 尚未实现 LLC 域扫描及 sched_domain 层级逻辑。
-    /// `inner` 参数强制调用者必须已持有 pi_lock (inner_locked)。
+    /// ## 锁序
+    ///
+    /// 调用时必须已持有 `pi_lock`（通过 `pi_guard` 参数强制）。
+    /// cpus_allowed / nr_cpus_allowed 通过 pi_lock 保护
     pub fn select_task_rq(
         pcb: &Arc<ProcessControlBlock>,
-        inner: &crate::process::InnerSchedInfo,
+        pi_guard: &SpinLockGuard<'_, PiProtected>,
         prev_cpu: ProcessorId,
         wake_flags: u8,
     ) -> ProcessorId {
-        let cpus_allowed = inner.cpus_allowed();
+        let cpus_allowed = pi_guard.cpus_allowed();
         let current_cpu = smp_get_processor_id();
 
         // 如果负载均衡未启用，保持在原CPU（与原有行为一致）
@@ -96,7 +98,7 @@ impl LoadBalancer {
             return current_cpu;
         }
 
-        let nr_cpus_allowed = inner.nr_cpus_allowed();
+        let nr_cpus_allowed = pi_guard.nr_cpus_allowed();
         if nr_cpus_allowed <= 1 {
             if let Some(cpu) = cpus_allowed.iter_cpu().next() {
                 return cpu;
@@ -296,6 +298,8 @@ impl LoadBalancer {
     }
 }
 
+/// 负载均衡环境
+/// 封装单次 load_balance 调用所需的所有状态。
 pub struct LbEnv {
     pub sd: Option<Arc<SchedDomain>>,
     pub dst_cpu: ProcessorId,
@@ -312,9 +316,7 @@ pub struct LbEnv {
     pub cpus: CpuMask,
 }
 
-/// 更新调度组的负载均衡统计信息
-///
-/// 针对单层模型简化：
+/// 更新调度组的负载均衡统计信息（针对单层模型简化）
 /// - 遍历 sg.cpumask 中的所有 CPU
 /// - 累加 group_load, group_util, group_runnable, sum_h_nr_running, idle_cpus
 /// - 计算 group_capacity 和 group_weight
@@ -460,9 +462,7 @@ fn calculate_imbalance_single_group(env: &mut LbEnv, sds: &SdLbStats) {
     }
 }
 
-/// 查找最忙的调度组
-///
-/// 针对单层单组模型简化：
+/// 查找最忙的调度组（针对单层单组模型简化）
 /// - 调用 update_sd_lb_stats 统计域信息
 /// - 对唯一的组进行分类
 /// - 若组为 Overloaded 或本地 CPU 空闲且组内有任务，则返回该组
@@ -489,9 +489,7 @@ pub fn find_busiest_group(env: &mut LbEnv) -> Option<Arc<SchedGroup>> {
     None
 }
 
-/// 查找最忙的运行队列
-///
-/// 针对单层模型简化：
+/// 查找最忙的运行队列（针对单层模型简化）
 /// - 遍历 group.cpumask 中的 CPU
 /// - 根据 env.migration_type 选择最忙的 CPU
 /// - 返回最忙 CPU 的 ProcessorId
@@ -625,8 +623,7 @@ fn shr_bound(val: u64, shift: u32) -> u64 {
     (val >> shift).max(1)
 }
 
-/// 从 src_rq 分离任务，直到满足 env.imbalance。
-///
+/// 从 src_rq 分离任务，直到满足 env.imbalance。调用时必须持有 src_rq 锁。
 /// 返回实际分离的任务数量。
 pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
     let cfs_rq_arc = src_rq.cfs_rq();
@@ -745,7 +742,7 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
     detached
 }
 
-/// 将 env.tasks 中已分离的任务附加到 dst_rq。
+/// 将 env.tasks 中已分离的任务附加到 dst_rq。调用时必须持有 dst_rq 锁。
 pub fn attach_tasks(dst_rq: &mut CpuRunQueue, env: &mut LbEnv) {
     while let Some(pcb) = env.tasks.pop_front() {
         dst_rq.activate_task(&pcb, EnqueueFlag::ENQUEUE_MIGRATED);
@@ -753,7 +750,7 @@ pub fn attach_tasks(dst_rq: &mut CpuRunQueue, env: &mut LbEnv) {
     }
 }
 
-/// 执行负载均衡。
+/// 执行负载均衡：
 /// 1. 仅锁 busiest rq → detach_tasks → 释放 busiest rq 锁
 /// 2. 锁 dst rq → attach_tasks → 释放 dst rq 锁
 ///

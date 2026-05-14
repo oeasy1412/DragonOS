@@ -365,8 +365,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         }
                         has_waitable_child = true;
 
-                        let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
-                        let state = sched_guard.state();
+                        let state = pcb.sched_info().state();
                         if !pcb.is_zombie() {
                             all_waitable_children_exited = false;
                         }
@@ -387,7 +386,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
                             scan_result = Some(Ok((*pid).into()));
-                            drop(sched_guard);
+
                             break;
                         } else if kwo.options.contains(WaitOption::WCONTINUED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_CONTINUED)
@@ -403,15 +402,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
                             scan_result = Some(Ok((*pid).into()));
-                            drop(sched_guard);
+
                             break;
                         } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
                             if reap_blocked_by_group_exec(&pcb) {
-                                drop(sched_guard);
                                 continue;
                             }
                             let Some(code) = state.exit_code() else {
-                                drop(sched_guard);
                                 continue;
                             };
                             let raw = code as i32;
@@ -426,16 +423,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             tmp_child_pcb = Some(pcb.clone());
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 if !pcb.try_mark_dead_from_zombie() {
-                                    drop(sched_guard);
                                     continue;
                                 }
                                 pid_to_release = Some(pcb.raw_pid());
                             }
                             scan_result = Some(Ok((*pid).into()));
-                            drop(sched_guard);
+
                             break;
                         }
-                        drop(sched_guard);
                     }
                     drop(rd_children);
                     if let Some(pid) = pid_to_release {
@@ -481,8 +476,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             }
                             has_waitable_child = true;
 
-                            let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
-                            let state = sched_guard.state();
+                            let state = pcb.sched_info().state();
                             if !pcb.is_zombie() {
                                 all_waitable_children_exited = false;
                             }
@@ -503,7 +497,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                                 }
                                 scan_result = Some(Ok((*pid).into()));
-                                drop(sched_guard);
+
                                 break;
                             } else if kwo.options.contains(WaitOption::WCONTINUED)
                                 && pcb.sighand().flags_contains(SignalFlags::CLD_CONTINUED)
@@ -519,15 +513,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                                 }
                                 scan_result = Some(Ok((*pid).into()));
-                                drop(sched_guard);
+
                                 break;
                             } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
                                 if reap_blocked_by_group_exec(&pcb) {
-                                    drop(sched_guard);
                                     continue;
                                 }
                                 let Some(code) = state.exit_code() else {
-                                    drop(sched_guard);
                                     continue;
                                 };
                                 let raw = code as i32;
@@ -542,16 +534,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 tmp_child_pcb = Some(pcb.clone());
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     if !pcb.try_mark_dead_from_zombie() {
-                                        drop(sched_guard);
                                         continue;
                                     }
                                     pid_to_release = Some(pcb.raw_pid());
                                 }
                                 scan_result = Some(Ok((*pid).into()));
-                                drop(sched_guard);
+
                                 break;
                             }
-                            drop(sched_guard);
                         }
                         drop(rd_childen);
                         if let Some(pid) = pid_to_release {
@@ -633,8 +623,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         }
                         has_matching_child = true;
 
-                        let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
-                        let state = sched_guard.state();
+                        let state = pcb.sched_info().state();
                         if !pcb.is_zombie() {
                             all_matching_children_exited = false;
                         }
@@ -654,7 +643,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
-                            drop(sched_guard);
+
                             scan_result = Some(Ok(pcb.task_pid_vnr().into()));
                             break;
                         } else if kwo.options.contains(WaitOption::WCONTINUED)
@@ -670,16 +659,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
-                            drop(sched_guard);
+
                             scan_result = Some(Ok(pcb.task_pid_vnr().into()));
                             break;
                         } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
                             if reap_blocked_by_group_exec(&pcb) {
-                                drop(sched_guard);
                                 continue;
                             }
                             let Some(code) = state.exit_code() else {
-                                drop(sched_guard);
                                 continue;
                             };
                             let raw = code as i32;
@@ -694,16 +681,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             tmp_child_pcb = Some(pcb.clone());
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 if !pcb.try_mark_dead_from_zombie() {
-                                    drop(sched_guard);
                                     continue;
                                 }
                                 pid_to_release = Some(pcb.raw_pid());
                             }
-                            drop(sched_guard);
+
                             scan_result = Some(Ok(pcb.task_pid_vnr().into()));
                             break;
                         }
-                        drop(sched_guard);
                     }
                     drop(rd_children);
                     if let Some(pid) = pid_to_release {
@@ -760,8 +745,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             }
                             has_matching_child = true;
 
-                            let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
-                            let state = sched_guard.state();
+                            let state = pcb.sched_info().state();
 
                             if !pcb.is_zombie() {
                                 all_matching_children_exited = false;
@@ -783,7 +767,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                                 }
                                 scan_result = Some(Ok(pcb.task_pid_vnr().into()));
-                                drop(sched_guard);
+
                                 break;
                             } else if kwo.options.contains(WaitOption::WCONTINUED)
                                 && pcb.sighand().flags_contains(SignalFlags::CLD_CONTINUED)
@@ -799,15 +783,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                                 }
                                 scan_result = Some(Ok(pcb.task_pid_vnr().into()));
-                                drop(sched_guard);
+
                                 break;
                             } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
                                 if reap_blocked_by_group_exec(&pcb) {
-                                    drop(sched_guard);
                                     continue;
                                 }
                                 let Some(code) = state.exit_code() else {
-                                    drop(sched_guard);
                                     continue;
                                 };
                                 let raw = code as i32;
@@ -822,16 +804,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 tmp_child_pcb = Some(pcb.clone());
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     if !pcb.try_mark_dead_from_zombie() {
-                                        drop(sched_guard);
                                         continue;
                                     }
                                     pid_to_release = Some(pcb.raw_pid());
                                 }
                                 scan_result = Some(Ok(pcb.task_pid_vnr().into()));
-                                drop(sched_guard);
+
                                 break;
                             }
-                            drop(sched_guard);
                         }
                         drop(rd_children);
                         if let Some(pid) = pid_to_release {
@@ -922,7 +902,7 @@ fn do_waitpid(
         return Some(Ok(child_pcb.raw_pid().data()));
     }
 
-    let state = child_pcb.sched_info().inner_lock_read_irqsave().state();
+    let state = child_pcb.sched_info().state();
     // 获取退出码
     match state {
         ProcessState::Runnable => {
@@ -1031,7 +1011,7 @@ impl ProcessControlBlock {
         //     "Process {} is exiting, group_dead: {}, state: {:?}",
         //     self.raw_pid(),
         //     group_dead,
-        //     self.sched_info().inner_lock_read_irqsave().state()
+        //     self.sched_info().state()
         // );
         if group_dead {
             tty = sig_guard.tty();

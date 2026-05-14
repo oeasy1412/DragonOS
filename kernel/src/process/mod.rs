@@ -6,7 +6,9 @@ use core::{
     intrinsics::unlikely,
     mem::ManuallyDrop,
     str::FromStr,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{
+        compiler_fence, fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    },
 };
 
 use alloc::{
@@ -308,35 +310,16 @@ impl ProcessManager {
     }
 
     /// 封装唤醒后的任务入队与抢占检查逻辑。
+    ///
+    /// 调用时 pi_lock 已持有（由 wakeup / wakeup_stop 持有），本函数内获取 rq_lock。
+    /// 锁序：pi_lock → rq_lock（与 Linux try_to_wake_up 一致）。
     fn ttwu_do_activate(
         pcb: &Arc<ProcessControlBlock>,
         prev_cpu: ProcessorId,
+        target_cpu: ProcessorId,
         wake_flags: WakeupFlags,
     ) {
         ProcessManager::current_pcb().sched_info().record_wakee(pcb);
-
-        // Linux try_to_wake_up: select_task_rq 在 pi_lock 保护下调用。
-        // 但 pi_lock 必须在 ttwu_queue（发 IPI）之前释放，
-        // 否则远程 CPU 的 IPI handler 若需 pi_lock 会导致跨 CPU 死锁。
-        let target_cpu = {
-            let sched_info_guard = pcb.sched_info().inner_lock_read_irqsave();
-            let cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
-                pcb,
-                &sched_info_guard,
-                prev_cpu,
-                wake_flags.bits(),
-            );
-            if cpu == ProcessorId::INVALID {
-                log::warn!(
-                    "ttwu_do_activate: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
-                    pcb.raw_pid()
-                );
-                smp_get_processor_id()
-            } else {
-                cpu
-            }
-        };
-        // pi_lock 已释放，现在安全调用 ttwu_queue（发送 IPI）
 
         if target_cpu != smp_get_processor_id() {
             crate::sched::ttwu_queue(pcb, target_cpu, wake_flags);
@@ -349,9 +332,6 @@ impl ProcessManager {
 
         let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
 
-        // 1. nr_iowait 在 set_task_cpu 之前于 source rq 递减
-        // 2. set_task_cpu 迁移到目标 rq
-        // 3. nr_uninterruptible 在 set_task_cpu 之后于目标 rq（已持锁）递减
         if target_cpu != prev_cpu {
             if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
                 cpu_rq(prev_cpu.data() as usize).dec_nr_iowait();
@@ -366,7 +346,6 @@ impl ProcessManager {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
 
-        // nr_uninterruptible: 在目标 rq（已持锁）递减
         if pcb
             .flags()
             .contains(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
@@ -382,81 +361,88 @@ impl ProcessManager {
         rq.check_preempt_current(pcb, wake_flags);
     }
 
-    /// 唤醒一个进程
-    ///
-    /// 1. 先检查 on_rq，若已排队则走 ttwu_runnable 快速路径（不迁移、不重新入队）
-    /// 2. 若未排队，检查 on_cpu：若 task 正在运行（on_cpu 不为 None），将 wakeup 放入其
-    ///    所在 CPU 的 WakeQueue，由该 CPU 在 switch_finish_hook 后处理（对齐 Linux
-    ///    ttwu_queue_wakelist）。避免在 __schedule 的 dequeue 窗口内并发 set_task_cpu。
-    /// 3. 若 on_rq == None 且 on_cpu == None，走完整 ttwu_do_activate 路径。
+    /// try_to_wake_up：持有 pi_lock 后设置 state 为 Runnable（对应 Linux TASK_WAKING），
+    /// 然后嵌套 rq_lock 做 ttwu_runnable / select_task_rq / ttwu_do_activate。
+    /// pi_lock(SpinLock) → rq_lock(SpinLock) 嵌套安全。
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if state.is_blocked() {
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            let state = writer.state();
-            if state.is_blocked() {
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
-                drop(writer);
 
-                // 防止 CPU 将 on_rq 的加载重排到 state 写入之前。
-                core::sync::atomic::fence(Ordering::SeqCst);
+        let pi_guard = pcb.sched_info().pi_lock_irqsave();
 
-                // retry 循环。
-                let mut rq_to_lock = task_cpu(pcb);
-                let _on_rq = loop {
-                    let rq_arc = cpu_rq(rq_to_lock.data() as usize);
-                    let (rq_ref, guard) = rq_arc.self_lock();
-                    let current_cpu = task_cpu(pcb);
-                    if current_cpu != rq_to_lock || pcb.sched_info().on_rq.get() == OnRq::Migrating
-                    {
-                        drop(guard);
-                        rq_to_lock = current_cpu;
-                        continue;
-                    }
-                    let on_rq = pcb.sched_info().on_rq.get();
-                    if on_rq == OnRq::Queued {
-                        rq_ref.update_rq_clock();
-                        rq_ref.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
-                        drop(guard);
-                        return Ok(());
-                    }
-                    drop(guard);
-                    break on_rq;
-                };
-
-                let prev_cpu = task_cpu(pcb);
-
-                // rq lock 释放后、读取 on_cpu 之前插入 acquire fence，
-                // 防止 CPU 将 on_cpu 的加载重排到 on_rq 的加载之前。
-                core::sync::atomic::fence(Ordering::Acquire);
-
-                if let Some(cpu_id) = pcb.sched_info().on_cpu() {
-                    log::trace!(
-                        "wakeup: pid={:?} on_cpu={:?}, queue to wakelist",
-                        pcb.raw_pid(),
-                        cpu_id
-                    );
-                    let wq = crate::sched::cpu_wakequeue(cpu_id.data() as usize);
-                    wq.push(pcb.clone());
-                    crate::sched::send_resched_ipi(cpu_id);
-                } else {
-                    Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU);
-                }
-                return Ok(());
-            } else if state.is_exited() {
+        let state = pcb.sched_info().state();
+        if !state.is_blocked() {
+            if state.is_exited() {
                 return Err(SystemError::EINVAL);
-            } else {
-                return Ok(());
             }
-        } else if state.is_exited() {
-            return Err(SystemError::EINVAL);
-        } else {
             return Ok(());
         }
+
+        pcb.sched_info().set_state(ProcessState::Runnable);
+        pcb.sched_info().set_wakeup(); // clears sleep + wake_kill under pi_lock
+
+        // 防止 CPU 将 on_rq 的加载重排到 state 写入之前。
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        // 在 pi_lock 内获取 rq_lock (SpinLock → SpinLock nesting)
+        let mut rq_to_lock = task_cpu(pcb);
+        let _on_rq = loop {
+            let rq_arc = cpu_rq(rq_to_lock.data() as usize);
+            let (rq_ref, guard) = rq_arc.self_lock();
+            let current_cpu = task_cpu(pcb);
+            if current_cpu != rq_to_lock || pcb.sched_info().on_rq.get() == OnRq::Migrating {
+                drop(guard);
+                rq_to_lock = current_cpu;
+                continue;
+            }
+            let on_rq = pcb.sched_info().on_rq.get();
+            if on_rq == OnRq::Queued {
+                rq_ref.update_rq_clock();
+                rq_ref.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
+                drop(guard);
+                return Ok(());
+            }
+            drop(guard);
+            break on_rq;
+        };
+
+        let prev_cpu = task_cpu(pcb);
+
+        // rq lock 释放后、读取 on_cpu 之前插入 acquire fence，
+        // 防止 CPU 将 on_cpu 的加载重排到 on_rq 的加载之前。
+        core::sync::atomic::fence(Ordering::Acquire);
+
+        // smp_load_acquire(&p->on_cpu) && ttwu_queue_wakelist
+        if let Some(cpu_id) = pcb.sched_info().on_cpu() {
+            // 在 pi_lock 保护下 push wakelist + 发 IPI
+            let wq = crate::sched::cpu_wakequeue(cpu_id.data() as usize);
+            wq.push(pcb.clone());
+            crate::sched::send_resched_ipi(cpu_id);
+            return Ok(());
+        }
+
+        // select_task_rq 在 pi_lock 保护下调用
+        let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+            pcb,
+            &pi_guard,
+            prev_cpu,
+            WakeupFlags::WF_TTWU.bits(),
+        );
+
+        let target_cpu = if target_cpu == ProcessorId::INVALID {
+            log::warn!(
+                "wakeup: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
+                pcb.raw_pid()
+            );
+            smp_get_processor_id()
+        } else {
+            target_cpu
+        };
+
+        Self::ttwu_do_activate(pcb, prev_cpu, target_cpu, WakeupFlags::WF_TTWU);
+        Ok(())
     }
 
+    /// 仅允许 KTHREAD 设置为 FIFO 策略。
     pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError> {
         if !pcb.flags().contains(ProcessFlags::KTHREAD) {
             return Err(SystemError::EPERM);
@@ -468,8 +454,8 @@ impl ProcessManager {
 
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        // 先获取 task 所在 CPU 的 rq 锁，再操作 on_rq
-        // 避免与 load_balance / activate_task 的 rq -> on_rq 顺序产生 ABBA 死锁。
+        // 先获取 rq_lock 再操作 on_rq / sched_policy，保证与 load_balance 等路径的锁序一致。
+        // sched_policy 和 prio_data 使用独立 RwLock，不与 rq_lock 构成嵌套。
         let target_cpu = task_cpu(pcb);
         let rq = cpu_rq(target_cpu.data() as usize);
         let (rq, _rq_guard) = rq.self_lock();
@@ -522,28 +508,75 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// 唤醒暂停的进程
+    /// 唤醒暂停的进程（用于 SIGCONT 等作业控制继续）
+    /// 仅在 state 判断上不同（Stopped → Runnable）
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if let ProcessState::Stopped = state {
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            let state = writer.state();
-            if let ProcessState::Stopped = state {
-                writer.set_state(ProcessState::Runnable);
-                // Stopped -> Runnable：必须清理 sleep 标志，否则调度器可能把该任务当作“睡眠出队”处理。
-                writer.set_wakeup();
-                // avoid deadlock
-                drop(writer);
 
-                let prev_cpu = task_cpu(pcb);
-                Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU);
+        let pi_guard = pcb.sched_info().pi_lock_irqsave();
+
+        let state = pcb.sched_info().state();
+        if let ProcessState::Stopped = state {
+            pcb.sched_info().set_state(ProcessState::Runnable);
+            // Stopped -> Runnable：必须清理 sleep 标志，否则调度器可能把该任务当作“睡眠出队”处理。
+            pcb.sched_info().set_wakeup();
+
+            core::sync::atomic::fence(Ordering::SeqCst);
+
+            // 注意: STOPPED 任务在 stop_task 后可能尚未完成 schedule() 出队，
+            // 此时 on_rq 仍可能为 Queued，需要走 ttwu_runnable 快速路径。
+            let mut rq_to_lock = task_cpu(pcb);
+            let _on_rq = loop {
+                let rq_arc = cpu_rq(rq_to_lock.data() as usize);
+                let (rq_ref, guard) = rq_arc.self_lock();
+                let current_cpu = task_cpu(pcb);
+                if current_cpu != rq_to_lock || pcb.sched_info().on_rq.get() == OnRq::Migrating {
+                    drop(guard);
+                    rq_to_lock = current_cpu;
+                    continue;
+                }
+                let on_rq = pcb.sched_info().on_rq.get();
+                if on_rq == OnRq::Queued {
+                    rq_ref.update_rq_clock();
+                    rq_ref.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
+                    drop(guard);
+                    return Ok(());
+                }
+                drop(guard);
+                break on_rq;
+            };
+
+            let prev_cpu = task_cpu(pcb);
+
+            core::sync::atomic::fence(Ordering::Acquire);
+
+            if let Some(cpu_id) = pcb.sched_info().on_cpu() {
+                let wq = crate::sched::cpu_wakequeue(cpu_id.data() as usize);
+                wq.push(pcb.clone());
+                crate::sched::send_resched_ipi(cpu_id);
                 return Ok(());
-            } else if state.is_runnable() {
-                return Ok(());
-            } else {
-                return Err(SystemError::EINVAL);
             }
+
+            let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+                pcb,
+                &pi_guard,
+                prev_cpu,
+                WakeupFlags::WF_TTWU.bits(),
+            );
+
+            let target_cpu = if target_cpu == ProcessorId::INVALID {
+                log::warn!(
+                    "wakeup_stop: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
+                    pcb.raw_pid()
+                );
+                smp_get_processor_id()
+            } else {
+                target_cpu
+            };
+
+            // ttwu_queue 在 pi_lock 保护下调用
+            Self::ttwu_do_activate(pcb, prev_cpu, target_cpu, WakeupFlags::WF_TTWU);
+            return Ok(());
         } else if state.is_runnable() {
             return Ok(());
         } else {
@@ -555,23 +588,22 @@ impl ProcessManager {
     ///
     /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
     /// 与 `mark_stop`（仅当前进程）相对应。
+    /// 仅获取 rq_lock（不需要 pi_lock）：设置 state 为 Stopped 是单向操作，
+    /// 与 wakeup 的 pi_lock → rq_lock 路径通过 rq_lock 序列化 on_rq 操作即可。
     pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        let state = writer.state();
+        let state = pcb.sched_info().state();
         if matches!(state, ProcessState::Exited(_)) {
             return Err(SystemError::EINTR);
         }
 
         // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
-        writer.set_state(ProcessState::Stopped);
+        pcb.sched_info().set_state(ProcessState::Stopped);
         // stop 后不应再被视为“睡眠任务”，避免后续调度错误地做 DEQUEUE_SLEEP。
-        writer.set_wakeup();
+        pcb.sched_info().set_wakeup();
         pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-        drop(writer);
 
-        // 对齐 Linux task_rq_lock 顺序：先获取 rq 锁，再操作 on_rq。
-        // 避免与 load_balance / activate_task 的 rq -> on_rq 顺序产生 ABBA 死锁。
+        // 先获取 rq_lock 再操作 on_rq，与 wakeup / load_balance 路径一致
         let target_cpu = task_cpu(pcb);
         let rq = cpu_rq(target_cpu.data() as usize);
         let (rq, _rq_guard) = rq.self_lock();
@@ -599,7 +631,7 @@ impl ProcessManager {
     ///
     /// ## 注意
     ///
-    /// - 进入当前函数之前，不能持有sched_info的锁
+    /// - 此函数仅操作当前进程的原子字段（state_atomic / mark_sleep），不需要获取 pi_lock
     /// - 进入当前函数之前，必须关闭中断
     /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
@@ -608,13 +640,12 @@ impl ProcessManager {
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        if !matches!(writer.state(), ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Blocked(interruptable));
-            writer.set_sleep();
+        if !matches!(pcb.sched_info().state(), ProcessState::Exited(_)) {
+            pcb.sched_info()
+                .set_state(ProcessState::Blocked(interruptable));
+            pcb.sched_info().set_sleep();
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             fence(Ordering::SeqCst);
-            drop(writer);
             return Ok(());
         }
         return Err(SystemError::EINTR);
@@ -622,20 +653,21 @@ impl ProcessManager {
 
     /// TASK_KILLABLE (TASK_UNINTERRUPTIBLE | TASK_WAKEKILL)。
     /// 仅 fatal signal (SIGKILL) 可唤醒，非 fatal signal 不中断睡眠。
+    ///
+    /// 通过 set_wake_kill() 设置 AtomicBool，__schedule 在 rq_lock 内无锁读取。
+    /// 此函数不获取 pi_lock，仅操作当前任务的原子字段。
     pub fn mark_sleep_killable() -> Result<(), SystemError> {
         assert!(
             !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep_killable()"
         );
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        if !matches!(writer.state(), ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Blocked(false));
-            writer.set_wake_kill();
-            writer.set_sleep();
+        if !matches!(pcb.sched_info().state(), ProcessState::Exited(_)) {
+            pcb.sched_info().set_state(ProcessState::Blocked(false));
+            pcb.sched_info().set_wake_kill();
+            pcb.sched_info().set_sleep();
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             fence(Ordering::SeqCst);
-            drop(writer);
             return Ok(());
         }
         Err(SystemError::EINTR)
@@ -645,7 +677,7 @@ impl ProcessManager {
     ///
     /// ## 注意
     ///
-    /// - 进入当前函数之前，不能持有sched_info的锁
+    /// - 此函数仅操作当前进程的原子字段（state_atomic / mark_sleep），不需要获取 pi_lock
     /// - 进入当前函数之前，必须关闭中断
     pub fn mark_stop() -> Result<(), SystemError> {
         assert!(
@@ -654,12 +686,10 @@ impl ProcessManager {
         );
 
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        if !matches!(writer.state(), ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Stopped);
+        if !matches!(pcb.sched_info().state(), ProcessState::Exited(_)) {
+            pcb.sched_info().set_state(ProcessState::Stopped);
+            pcb.sched_info().set_wakeup();
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
-
             return Ok(());
         }
         return Err(SystemError::EINTR);
@@ -866,9 +896,7 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
-            pcb.sched_info
-                .inner_lock_write_irqsave()
-                .set_state(ProcessState::Exited(exit_code));
+            pcb.sched_info.set_state(ProcessState::Exited(exit_code));
             // Linux 语义：zombie 不应出现在 cgroup.procs 中。
             // 必须持有 cgroup_accounting_lock 以避免与 cgroup.procs 写入死锁
             {
@@ -1228,8 +1256,51 @@ impl ExitState {
     }
 }
 
+mod state_bits {
+    pub const TASK_RUNNING: u32 = 0x0000;
+    pub const TASK_INTERRUPTIBLE: u32 = 0x0001;
+    pub const TASK_UNINTERRUPTIBLE: u32 = 0x0002;
+    pub const TASK_STOPPED: u32 = 0x0004;
+    pub const TASK_DEAD_MARKER: u32 = 0x0100;
+    pub const EXIT_CODE_SHIFT: u32 = 12;
+}
+
 #[allow(dead_code)]
 impl ProcessState {
+    #[inline]
+    pub fn to_u32(self) -> u32 {
+        match self {
+            ProcessState::Runnable => state_bits::TASK_RUNNING,
+            ProcessState::Blocked(true) => state_bits::TASK_INTERRUPTIBLE,
+            ProcessState::Blocked(false) => state_bits::TASK_UNINTERRUPTIBLE,
+            ProcessState::Stopped => state_bits::TASK_STOPPED,
+            ProcessState::Exited(code) => {
+                state_bits::TASK_DEAD_MARKER | ((code as u32) << state_bits::EXIT_CODE_SHIFT)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn from_u32(val: u32) -> Self {
+        if val & state_bits::TASK_DEAD_MARKER != 0 {
+            let code = (val >> state_bits::EXIT_CODE_SHIFT) as usize;
+            ProcessState::Exited(code)
+        } else {
+            match val {
+                v if v == state_bits::TASK_RUNNING => ProcessState::Runnable,
+                v if v == state_bits::TASK_INTERRUPTIBLE => ProcessState::Blocked(true),
+                v if v == state_bits::TASK_UNINTERRUPTIBLE => ProcessState::Blocked(false),
+                v if v == state_bits::TASK_STOPPED => ProcessState::Stopped,
+                _ => {
+                    log::error!(
+                        "ProcessState::from_u32: corrupted state value 0x{val:08x}, defaulting to Stopped"
+                    );
+                    ProcessState::Stopped
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     pub fn is_runnable(&self) -> bool {
         return matches!(self, ProcessState::Runnable);
@@ -1349,7 +1420,7 @@ pub struct ProcessItimer {
 #[derive(Debug, Default)]
 pub struct ProcessItimers {
     pub real: Option<ProcessItimer>, // 用于 ITIMER_REAL
-    pub virt: CpuItimer,             // 用于 ITIMER_REAL
+    pub virt: CpuItimer,             // 用于 ITIMER_VIRTUAL
     pub prof: CpuItimer,             // 用于 ITIMER_PROF
 }
 
@@ -2308,17 +2379,11 @@ impl ProcessControlBlock {
     }
 
     pub fn is_exited(&self) -> bool {
-        self.sched_info
-            .inner_lock_read_irqsave()
-            .state()
-            .is_exited()
+        self.sched_info.state().is_exited()
     }
 
     pub fn exit_code(&self) -> Option<usize> {
-        self.sched_info
-            .inner_lock_read_irqsave()
-            .state()
-            .exit_code()
+        self.sched_info.state().exit_code()
     }
 
     pub fn exit_state(&self) -> ExitState {
@@ -2645,7 +2710,23 @@ pub struct ProcessSchedulerInfo {
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
     migrate_to: AtomicProcessorId,
-    inner_locked: RwLock<InnerSchedInfo>,
+    /// 进程状态（Runnable / Blocked / Stopped / Exited）的原子存储。
+    /// 写入方：wakeup (pi_lock 内)、mark_sleep (当前任务，无锁)、exit (当前任务)。
+    /// 读取方：__schedule (rq_lock 内，无锁)、wakeup (pi_lock 内)。
+    state_atomic: AtomicU32,
+    /// 对标 Linux: TASK_WAKEKILL — 仅 fatal signal 可唤醒。
+    /// 在 Linux 中 TASK_WAKEKILL 是 __state 位掩码的一部分，此处用 AtomicBool 独立存储，
+    /// 使 __schedule 可在 rq_lock 内无锁读取，避免 rq_lock → pi_lock 的 ABBA 死锁。
+    wake_kill: AtomicBool,
+    /// 对标 Linux: sched_contributes_to_load 的等价标志。
+    /// mark_sleep/mark_sleep_killable 设置，__schedule 读取后通过 set_wakeup 清除。
+    /// AtomicBool 使 __schedule 无需获取 pi_lock 即可读取。
+    mark_sleep: AtomicBool,
+    /// 对标 Linux `task_struct::pi_lock`（raw_spinlock_t）。
+    /// 保护 cpus_allowed / nr_cpus_allowed（CPU affinity），
+    /// 以及 wakeup 路径与 __schedule 之间的 state 一致性。
+    /// 锁序：pi_lock 可嵌套 rq_lock（pi_lock → rq_lock），禁止反向嵌套。
+    pi_lock: SpinLock<PiProtected>,
     /// 进程的调度优先级
     // priority: SchedPriority,
     /// 当前进程的虚拟运行时间
@@ -2700,76 +2781,36 @@ impl Default for PrioData {
     }
 }
 
+/// 由 pi_lock 保护的字段集合。
 #[derive(Debug)]
-pub struct InnerSchedInfo {
-    /// 当前进程的状态
-    state: ProcessState,
-    /// 进程的调度策略
-    sleep: bool,
-    /// TASK_WAKEKILL：仅 fatal signal 可唤醒。
-    /// 由 mark_sleep_killable() 设置，__schedule 读取后通过 set_wakeup() 清除。
-    wake_kill: bool,
-
-    /// 由 pi_lock 独占保护的 CPU 亲和性掩码。
-    cpus_allowed: CpuMask,
-    nr_cpus_allowed: usize,
+pub struct PiProtected {
+    pub cpus_allowed: CpuMask,
+    pub nr_cpus_allowed: usize,
 }
 
-impl InnerSchedInfo {
+impl PiProtected {
     pub fn new(cpus_allowed: CpuMask) -> Self {
         let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
         Self {
-            state: ProcessState::Blocked(false),
-            sleep: false,
-            wake_kill: false,
             cpus_allowed,
             nr_cpus_allowed,
         }
     }
 
-    pub fn state(&self) -> ProcessState {
-        self.state
-    }
-
-    pub fn set_state(&mut self, state: ProcessState) {
-        self.state = state;
-    }
-
-    pub fn set_sleep(&mut self) {
-        self.sleep = true;
-    }
-
-    pub fn set_wakeup(&mut self) {
-        self.sleep = false;
-        self.wake_kill = false;
-    }
-
-    pub fn is_mark_sleep(&self) -> bool {
-        self.sleep
-    }
-
-    pub fn is_wake_kill(&self) -> bool {
-        self.wake_kill
-    }
-
-    pub fn set_wake_kill(&mut self) {
-        self.wake_kill = true;
-    }
-
-    /// 读取 cpus_allowed（需在 pi_lock 保护下调用）。
+    /// 读取 cpus_allowed 的引用。
     pub fn cpus_allowed(&self) -> &CpuMask {
         &self.cpus_allowed
     }
 
-    /// 写入 cpus_allowed（需在 pi_lock 写锁保护下调用）。
+    /// 读取允许的 CPU 数量。
+    pub fn nr_cpus_allowed(&self) -> usize {
+        self.nr_cpus_allowed
+    }
+
+    /// 设置 cpus_allowed 并更新 nr_cpus_allowed。
     pub fn set_cpus_allowed(&mut self, new_mask: CpuMask) {
         self.cpus_allowed = new_mask;
         self.nr_cpus_allowed = self.cpus_allowed.iter_cpu().count();
-    }
-
-    /// 读取 nr_cpus_allowed（需在 pi_lock 保护下调用）。
-    pub fn nr_cpus_allowed(&self) -> usize {
-        self.nr_cpus_allowed
     }
 }
 
@@ -2793,7 +2834,10 @@ impl ProcessSchedulerInfo {
             on_cpu: AtomicProcessorId::new(cpu_id),
             cpu: AtomicProcessorId::new(cpu_id),
             migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
-            inner_locked: RwLock::new(InnerSchedInfo::new(cpus_allowed)),
+            state_atomic: AtomicU32::new(ProcessState::Blocked(false).to_u32()),
+            wake_kill: AtomicBool::new(false),
+            mark_sleep: AtomicBool::new(false),
+            pi_lock: SpinLock::new(PiProtected::new(cpus_allowed)),
             // virtual_runtime: AtomicIsize::new(0),
             // rt_time_slice: AtomicIsize::new(0),
             // priority: SchedPriority::new(100).unwrap(),
@@ -2861,39 +2905,46 @@ impl ProcessSchedulerInfo {
             .store(migrate_to.unwrap_or(ProcessorId::INVALID), Ordering::SeqCst);
     }
 
-    pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<'_, InnerSchedInfo> {
-        return self.inner_locked.write_irqsave();
+    pub fn state(&self) -> ProcessState {
+        ProcessState::from_u32(self.state_atomic.load(Ordering::Acquire))
     }
 
-    pub fn inner_lock_read_irqsave(&self) -> RwLockReadGuard<'_, InnerSchedInfo> {
-        return self.inner_locked.read_irqsave();
+    pub fn set_state(&self, state: ProcessState) {
+        self.state_atomic.store(state.to_u32(), Ordering::Release);
     }
 
-    // pub fn inner_lock_try_read_irqsave(
-    //     &self,
-    //     times: u8,
-    // ) -> Option<RwLockReadGuard<InnerSchedInfo>> {
-    //     for _ in 0..times {
-    //         if let Some(r) = self.inner_locked.try_read_irqsave() {
-    //             return Some(r);
-    //         }
-    //     }
+    /// 获取 pi_lock（SpinLock），同时关闭中断并禁用抢占。
+    /// 锁序：pi_lock 可嵌套 rq_lock（pi_lock → rq_lock），禁止反向。
+    pub fn pi_lock_irqsave(&self) -> SpinLockGuard<'_, PiProtected> {
+        self.pi_lock.lock_irqsave()
+    }
 
-    //     return None;
-    // }
+    /// 设置 mark_sleep 标志。由 mark_sleep / mark_sleep_killable 调用。
+    /// __schedule 在 rq_lock 内读取此标志，决定是否走 DEQUEUE_SLEEP 路径。
+    pub fn set_sleep(&self) {
+        self.mark_sleep.store(true, Ordering::Release);
+    }
 
-    // pub fn inner_lock_try_upgradable_read_irqsave(
-    //     &self,
-    //     times: u8,
-    // ) -> Option<RwLockUpgradableGuard<InnerSchedInfo>> {
-    //     for _ in 0..times {
-    //         if let Some(r) = self.inner_locked.try_upgradeable_read_irqsave() {
-    //             return Some(r);
-    //         }
-    //     }
+    /// 清除 mark_sleep 和 wake_kill 标志。在 wakeup / wakeup_stop / stop_task / mark_stop 中调用。
+    /// wakeup 路径在 pi_lock 内调用，mark_stop 在当前任务上下文中调用。
+    pub fn set_wakeup(&self) {
+        self.mark_sleep.store(false, Ordering::Release);
+        self.wake_kill.store(false, Ordering::Release);
+    }
 
-    //     return None;
-    // }
+    pub fn wake_kill(&self) -> bool {
+        self.wake_kill.load(Ordering::Acquire)
+    }
+
+    /// 设置 wake_kill 标志。由 mark_sleep_killable 调用，表示仅 fatal signal 可唤醒。
+    /// wakeup 路径在 pi_lock 内通过 set_wakeup 清除此标志。
+    pub fn set_wake_kill(&self) {
+        self.wake_kill.store(true, Ordering::Release);
+    }
+
+    pub fn is_mark_sleep(&self) -> bool {
+        self.mark_sleep.load(Ordering::Acquire)
+    }
 
     // pub fn virtual_runtime(&self) -> isize {
     //     return self.virtual_runtime.load(Ordering::SeqCst);
@@ -2928,17 +2979,15 @@ impl ProcessSchedulerInfo {
     }
 
     pub fn cpus_allowed(&self) -> CpuMask {
-        self.inner_locked.read_irqsave().cpus_allowed().clone()
+        self.pi_lock.lock_irqsave().cpus_allowed.clone()
     }
 
     pub fn nr_cpus_allowed(&self) -> usize {
-        self.inner_locked.read_irqsave().nr_cpus_allowed()
+        self.pi_lock.lock_irqsave().nr_cpus_allowed
     }
 
     pub fn set_cpus_allowed(&self, cpus_allowed: CpuMask) {
-        self.inner_locked
-            .write_irqsave()
-            .set_cpus_allowed(cpus_allowed);
+        self.pi_lock.lock_irqsave().set_cpus_allowed(cpus_allowed);
     }
 
     /// 记录唤醒关系，用于 `wake_wide` 判断。

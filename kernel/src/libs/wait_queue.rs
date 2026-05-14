@@ -856,13 +856,11 @@ fn block_current_impl(
         // Handle a wake racing between prepare_sleep and mark_sleep.
         if waiter.waker.consume_notification() {
             let pcb = ProcessManager::current_pcb();
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            if matches!(writer.state(), ProcessState::Blocked(_)) {
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
+            if matches!(pcb.sched_info().state(), ProcessState::Blocked(_)) {
+                pcb.sched_info().set_state(ProcessState::Runnable);
+                pcb.sched_info().set_wakeup();
             }
             pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
             drop(irq_guard);
             return Ok(());
         }
@@ -903,13 +901,11 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
 
         if waiter.waker.consume_notification() {
             let pcb = ProcessManager::current_pcb();
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            if matches!(writer.state(), ProcessState::Blocked(_)) {
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
+            if matches!(pcb.sched_info().state(), ProcessState::Blocked(_)) {
+                pcb.sched_info().set_state(ProcessState::Runnable);
+                pcb.sched_info().set_wakeup();
             }
             pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
             drop(irq_guard);
             return Ok(());
         }

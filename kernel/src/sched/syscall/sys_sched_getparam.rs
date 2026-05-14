@@ -1,3 +1,7 @@
+//! 对标 Linux `sys_sched_getparam()` (core.c:8150)。
+//!
+//! 获取指定进程（或当前进程）的实时调度优先级。
+
 use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
@@ -13,8 +17,6 @@ use crate::syscall::user_access::UserBufferWriter;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-/// Linux sched_param 结构体
-/// 与 musl-libc 中的定义保持一致
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PosixSchedParam {
@@ -24,34 +26,17 @@ struct PosixSchedParam {
     __reserved3: i32,
 }
 
-/// System call handler for the `sched_getparam` syscall
-///
-/// This handler implements the `Syscall` trait to provide functionality for getting
-/// scheduling parameters of a process.
+/// `sched_getparam` 系统调用处理。
 struct SysSchedGetparam;
 
 impl Syscall for SysSchedGetparam {
-    /// Returns the number of arguments expected by the `sched_getparam` syscall
     fn num_args(&self) -> usize {
         2
     }
 
-    /// Handles the `sched_getparam` system call
-    ///
-    /// Gets the scheduling parameters of the specified process.
-    /// If pid is 0, gets the scheduling parameters of the current process.
-    ///
-    /// # Arguments
-    /// * `args` - Array containing:
-    ///   - args[0]: Process ID (pid_t), 0 for current process
-    ///   - args[1]: Pointer to sched_param structure (*mut SchedParam)
-    /// * `frame` - Trap frame, used to determine if call originates from user space
-    ///
-    /// # Returns
-    /// * `Ok(0)`: Success
-    /// * `Err(SystemError::ESRCH)`: Process not found
-    /// * `Err(SystemError::EFAULT)`: Invalid user space pointer
-    /// * `Err(SystemError::EPERM)`: Permission denied
+    /// 获取指定进程的调度参数。pid=0 表示当前进程。
+    /// 写入用户的 `sched_param.sched_priority` 为实时优先级（1-99），
+    /// 非实时策略（CFS/IDLE）始终为 0。
     fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = Self::pid(args);
         let param = Self::param(args);
@@ -139,13 +124,7 @@ impl Syscall for SysSchedGetparam {
         Ok(0)
     }
 
-    /// Formats the syscall parameters for display/debug purposes
-    ///
-    /// # Arguments
-    /// * `args` - The raw syscall arguments
-    ///
-    /// # Returns
-    /// Vector of formatted parameters with descriptive names
+    /// 格式化系统调用参数用于日志输出。
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
             FormattedSyscallParam::new("pid", Self::pid(args).to_string()),
@@ -155,12 +134,10 @@ impl Syscall for SysSchedGetparam {
 }
 
 impl SysSchedGetparam {
-    /// Extracts the process ID from syscall arguments
     fn pid(args: &[usize]) -> usize {
         args[0]
     }
 
-    /// Extracts the sched_param pointer from syscall arguments
     fn param(args: &[usize]) -> *mut PosixSchedParam {
         args[1] as *mut PosixSchedParam
     }

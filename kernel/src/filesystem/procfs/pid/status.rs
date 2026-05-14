@@ -56,7 +56,7 @@ impl StatusFileOps {
         );
 
         let sched_info_guard = pcb.sched_info();
-        let state = sched_info_guard.inner_lock_read_irqsave().state();
+        let state = sched_info_guard.state();
         let cpu_id = sched_info_guard
             .on_cpu()
             .map(|cpu| cpu.data() as i32)

@@ -154,7 +154,7 @@ impl FileOps for StatFileOps {
 
         let comm = pcb.basic().name().to_string();
         let sched = pcb.sched_info();
-        let state = sched.inner_lock_read_irqsave().state();
+        let state = sched.state();
 
         let ppid = pcb
             .parent_pcb()

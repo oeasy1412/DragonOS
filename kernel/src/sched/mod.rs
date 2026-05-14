@@ -645,12 +645,7 @@ impl CpuRunQueue {
         }
 
         // 已退出进程不应被重新入队
-        if pcb
-            .sched_info()
-            .inner_lock_read_irqsave()
-            .state()
-            .is_exited()
-        {
+        if pcb.sched_info().state().is_exited() {
             log::trace!(
                 "activate_task: pid={:?} exited before activation, skip",
                 pcb.raw_pid()
@@ -820,7 +815,7 @@ impl CpuRunQueue {
         let cpu = self.cpu;
         let wq = cpu_wakequeue(cpu.data() as usize);
         for pcb in wq.drain() {
-            let state = pcb.sched_info().inner_lock_read_irqsave().state();
+            let state = pcb.sched_info().state();
             // 已退出进程不可被唤醒，跳过过期条目以防重新入队。
             if state.is_exited() {
                 continue;
@@ -1502,33 +1497,27 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
     if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
         && prev.sched_info().policy() != SchedPolicy::IDLE
     {
-        let (prev_state, wake_kill, is_mark_sleep) = {
-            let reader = prev.sched_info().inner_lock_read_irqsave();
-            (
-                reader.state(),
-                reader.is_wake_kill(),
-                reader.is_mark_sleep(),
-            )
-        };
+        // 关键设计：prev 的 state / wake_kill / mark_sleep 均通过 AtomicU32 / AtomicBool 无锁读取
+        // 因此 __schedule 持有 rq_lock 期间不需要再获取 pi_lock。
+        // （对比 ttwu 路径的 pi_lock → rq_lock 顺序）这避免了 rq_lock → pi_lock 的嵌套死锁风险。
+        let prev_state = prev.sched_info().state();
+        let wake_kill = prev.sched_info().wake_kill();
+        let is_mark_sleep = prev.sched_info().is_mark_sleep();
 
         let is_exited = matches!(prev_state, ProcessState::Exited(_));
 
-        if is_mark_sleep || is_exited {
+        let is_stopped = matches!(prev_state, ProcessState::Stopped);
+        if is_mark_sleep || is_exited || is_stopped {
             // switch_count = &prev->nvcsw
             voluntary_switch = true;
             let interruptible = matches!(prev_state, ProcessState::Blocked(true));
 
-            // 已退出任务不可被信号重新激活
             let has_signal =
                 !is_exited && Signal::signal_pending_state(interruptible, wake_kill, &prev);
             if has_signal {
-                // WRITE_ONCE(prev->__state, TASK_RUNNING);
-                // 在同一写锁临界区内将状态设为 Runnable 并清除 sleep/wake_kill 标志，避免中间状态被外部观察。
-                // 同时清除 SCHED_CONTRIBUTES_TO_LOAD，防止后续 ttwu_do_activate 路径重复递减 nr_uninterruptible。
                 prev.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
-                let mut writer = prev.sched_info().inner_lock_write_irqsave();
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
+                prev.sched_info().set_state(ProcessState::Runnable);
+                prev.sched_info().set_wakeup();
             } else if is_exited {
                 // TASK_DEAD 任务直接 deactivate，不计入负载。
                 prev.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
@@ -1637,6 +1626,11 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
     }
 }
 
+/// 初始化子进程的调度信息：继承父进程 normal_prio、设置调度策略、
+/// 初始化 PELT runnable average。
+///
+/// 注意：此函数在 fork 上下文中调用，子进程尚未加入 pid-hash，
+/// 因此锁操作（prio_data write、sched_policy write）无争用。
 pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     let mut prio_guard = pcb.sched_info().prio_data.write_irqsave();
     let current = ProcessManager::current_pcb();
@@ -1679,7 +1673,7 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
 
 /// Fork 后的唯一唤醒入口：做一次 select_task_rq(WF_FORK) 负载均衡，然后 activate_task。
 /// 锁序：Linux 先 pi_lock 再 rq->lock；此处 task 尚未加入 pid-hash，pi_lock 无争用，
-/// 因此只用 irqsave + rq->self_lock()。
+/// 远端路径通过 ttwu_queue 将 pi_lock 持有到 IPI 发送完成（SpinLock 不会与 rq_lock 产生 ABBA）。
 pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
@@ -1687,22 +1681,19 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
     // TODO: p->recent_used_cpu = task_cpu(p); 需要在 PCB 中新增该字段，
     //       以对齐 CFS select_task_rq_fair 的快速路径优化。
 
-    let target_cpu = {
-        let pi_guard = pcb.sched_info().inner_lock_read_irqsave();
-        let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
-            pcb,
-            &pi_guard,
-            prev_cpu,
-            WakeupFlags::WF_FORK.bits(),
-        );
-        target_cpu
-    };
-    // __set_task_cpu 之前，确保并发观察者先看到 TASK_RUNNING 再看到 CPU 迁移。
-    {
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        writer.set_state(ProcessState::Runnable);
-        writer.set_wakeup();
-    }
+    // 对标 Linux wake_up_new_task (core.c:4853-4854):
+    // raw_spin_lock_irqsave(&p->pi_lock) → WRITE_ONCE(p->__state, TASK_RUNNING)
+    // 先拿 pi_lock 再设 state，保证锁序与 Linux 一致。
+    let pi_guard = pcb.sched_info().pi_lock_irqsave();
+    pcb.sched_info().set_state(ProcessState::Runnable);
+    pcb.sched_info().set_wakeup();
+
+    let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+        pcb,
+        &pi_guard,
+        prev_cpu,
+        WakeupFlags::WF_FORK.bits(),
+    );
 
     let target_cpu = if target_cpu == ProcessorId::INVALID {
         log::error!(
@@ -1717,17 +1708,20 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
 
     let current_cpu = smp_get_processor_id();
     if target_cpu == current_cpu {
-        // Same CPU: direct activation
         let rq = cpu_rq(target_cpu.data() as usize);
         let (rq, _rq_guard) = rq.self_lock();
         rq.update_rq_clock();
         crate::sched::pelt::SchedulerAvg::post_init_entity_util_avg(pcb);
         rq.activate_task(pcb, EnqueueFlag::ENQUEUE_NOCLOCK);
         rq.check_preempt_current(pcb, WakeupFlags::WF_FORK);
+        drop(_rq_guard);
     } else {
-        // Remote CPU: use ttwu_queue path to avoid cross-CPU update_rq_clock
+        // Remote CPU: 对标 Linux ttwu_queue_wakelist
+        // SpinLock pi_lock 不会与 rq_lock（同为 SpinLock）产生 ABBA：
+        // 两者都是关中断自旋锁，nesting 顺序固定（pi_lock → rq_lock），无需提前释放。
         crate::sched::pelt::SchedulerAvg::post_init_entity_util_avg(pcb);
         crate::sched::ttwu_queue(pcb, target_cpu, WakeupFlags::WF_FORK);
+        return;
     }
     // TODO: 当 RT 调度实现后，需在此添加 sched_class::task_woken 回调
 }
@@ -1739,6 +1733,11 @@ pub fn task_cpu(pcb: &Arc<ProcessControlBlock>) -> ProcessorId {
     pcb.sched_info().cpu()
 }
 
+/// 更新任务的 CPU 绑定及对应的 cfs_rq 指针。
+///
+/// - 调用者必须保证任务不在运行队列上（on_rq != Queued），
+///   否则 cfs_rq 指针变更会导致 rbtree 操作在错误的队列上执行。
+/// - 目标 CPU 必须 online（boot 阶段除外）。
 pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     if smp_cpu_manager_initialized() && !boot_in_progress() {
         assert!(
