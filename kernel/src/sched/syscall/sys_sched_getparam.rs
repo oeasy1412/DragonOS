@@ -1,5 +1,3 @@
-//! 对标 Linux `sys_sched_getparam()` (core.c:8150)。
-//!
 //! 获取指定进程（或当前进程）的实时调度优先级。
 
 use system_error::SystemError;

@@ -383,27 +383,32 @@ impl ProcessManager {
         // 防止 CPU 将 on_rq 的加载重排到 state 写入之前。
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        // 在 pi_lock 内获取 rq_lock (SpinLock → SpinLock nesting)
-        let mut rq_to_lock = task_cpu(pcb);
-        let _on_rq = loop {
-            let rq_arc = cpu_rq(rq_to_lock.data() as usize);
-            let (rq_ref, guard) = rq_arc.self_lock();
-            let current_cpu = task_cpu(pcb);
-            if current_cpu != rq_to_lock || pcb.sched_info().on_rq.get() == OnRq::Migrating {
+        // 先无锁读 on_rq：
+        // on_rq != None (Queued/Migrating) → ttwu_runnable 路径，需要 rq lock。
+        // on_rq == None → 跳过 rq lock，直接走 SMP on_cpu / wakelist 路径，
+        // 避免在远端 __schedule 持有 rq lock 期间不必要的自旋。
+        if pcb.sched_info().on_rq.get() != OnRq::None {
+            let mut rq_to_lock = task_cpu(pcb);
+            loop {
+                let rq_arc = cpu_rq(rq_to_lock.data() as usize);
+                let (rq_ref, guard) = rq_arc.self_lock();
+                let current_cpu = task_cpu(pcb);
+                if current_cpu != rq_to_lock || pcb.sched_info().on_rq.get() == OnRq::Migrating {
+                    drop(guard);
+                    rq_to_lock = current_cpu;
+                    continue;
+                }
+                let on_rq = pcb.sched_info().on_rq.get();
+                if on_rq == OnRq::Queued {
+                    rq_ref.update_rq_clock();
+                    rq_ref.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
+                    drop(guard);
+                    return Ok(());
+                }
                 drop(guard);
-                rq_to_lock = current_cpu;
-                continue;
+                break;
             }
-            let on_rq = pcb.sched_info().on_rq.get();
-            if on_rq == OnRq::Queued {
-                rq_ref.update_rq_clock();
-                rq_ref.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
-                drop(guard);
-                return Ok(());
-            }
-            drop(guard);
-            break on_rq;
-        };
+        }
 
         let prev_cpu = task_cpu(pcb);
 
@@ -587,39 +592,49 @@ impl ProcessManager {
     /// 异步将目标进程置为停止状态（用于 SIGSTOP/SIGTSTP 等作业控制停止）
     ///
     /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
-    /// 与 `mark_stop`（仅当前进程）相对应。
-    /// 仅获取 rq_lock（不需要 pi_lock）：设置 state 为 Stopped 是单向操作，
-    /// 与 wakeup 的 pi_lock → rq_lock 路径通过 rq_lock 序列化 on_rq 操作即可。
+    /// pi_lock 内写入 state，与 wakeup / wakeup_stop 的 pi_lock → set_state 序列化。
+    /// pi_lock 释放后再获取 rq_lock 操作 on_rq，保持锁序不嵌套。
     pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().state();
-        if matches!(state, ProcessState::Exited(_)) {
-            return Err(SystemError::EINTR);
-        }
 
-        // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
-        pcb.sched_info().set_state(ProcessState::Stopped);
-        // stop 后不应再被视为“睡眠任务”，避免后续调度错误地做 DEQUEUE_SLEEP。
-        pcb.sched_info().set_wakeup();
+        // 在 pi_lock 内写 state
+        {
+            let _pi_guard = pcb.sched_info().pi_lock_irqsave();
+            let state = pcb.sched_info().state();
+            if matches!(state, ProcessState::Exited(_)) {
+                return Err(SystemError::EINTR);
+            }
+            // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
+            pcb.sched_info().set_state(ProcessState::Stopped);
+            // stop 后不应再被视为"睡眠任务"，避免后续调度错误地做 DEQUEUE_SLEEP。
+            // Stopped 任务必须设置 wake_kill=true，使 __schedule 的 signal_pending_state() 能检查到 WAKEKILL 位，
+            // 从而 fatal signal (SIGKILL) 可通过 __schedule 唤醒 Stopped 任务。
+            pcb.sched_info().set_stop();
+        }
         pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
 
-        // 先获取 rq_lock 再操作 on_rq，与 wakeup / load_balance 路径一致
-        let target_cpu = task_cpu(pcb);
-        let rq = cpu_rq(target_cpu.data() as usize);
-        let (rq, _rq_guard) = rq.self_lock();
+        // pi_lock 释放后获取 rq_lock，保持 pi_lock → rq_lock 顺序（不嵌套）
+        // rq_lock 必须在 kick() 之前释放：kick 发 IPI 到目标 CPU，
+        // 目标 CPU 的 IPI handler (drain_wake_queue) 会尝试获取自己的 rq_lock，
+        // 若此处仍持有目标 CPU 的 rq_lock，则形成 ABBA 死锁。
+        {
+            let target_cpu = task_cpu(pcb);
+            let rq = cpu_rq(target_cpu.data() as usize);
+            let (rq, _rq_guard) = rq.self_lock();
 
-        let on_rq = pcb.sched_info().on_rq.get();
-        if on_rq == OnRq::Queued {
-            let update_clock = target_cpu == smp_get_processor_id();
-            if update_clock {
-                rq.update_rq_clock();
+            let on_rq = pcb.sched_info().on_rq.get();
+            if on_rq == OnRq::Queued {
+                let update_clock = target_cpu == smp_get_processor_id();
+                if update_clock {
+                    rq.update_rq_clock();
+                }
+                // STOP 使任务不可运行：应从 rq 移除，但这不是 CPU 迁移。
+                // 使用 DEQUEUE_STOPPED 让 OnRq 进入 None，避免后续 activate_task() 走 ENQUEUE_MIGRATED 分支。
+                rq.deactivate_task(
+                    pcb.clone(),
+                    DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
             }
-            // STOP 使任务不可运行：应从 rq 移除，但这不是 CPU 迁移。
-            // 使用 DEQUEUE_STOPPED 让 OnRq 进入 None，避免后续 activate_task() 走 ENQUEUE_MIGRATED 分支。
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
         }
 
         // 强制让目标 CPU 尽快进入内核并重新调度，缩短 stop 生效延迟。
@@ -688,7 +703,7 @@ impl ProcessManager {
         let pcb = ProcessManager::current_pcb();
         if !matches!(pcb.sched_info().state(), ProcessState::Exited(_)) {
             pcb.sched_info().set_state(ProcessState::Stopped);
-            pcb.sched_info().set_wakeup();
+            pcb.sched_info().set_stop();
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             return Ok(());
         }
@@ -2673,7 +2688,6 @@ impl ProcessBasicInfo {
     }
 }
 
-/// 对标 Linux `task_struct::on_rq`（`unsigned int`）。
 /// 由 rq lock 保护的字段，写入须持有 rq lock，读取通常也在 rq lock 下进行。
 /// 使用 `UnsafeCell` + 手动 `Sync` impl 以避免 `SpinLock` 的 preempt_disable 开销。
 #[derive(Debug)]
@@ -2714,15 +2728,13 @@ pub struct ProcessSchedulerInfo {
     /// 写入方：wakeup (pi_lock 内)、mark_sleep (当前任务，无锁)、exit (当前任务)。
     /// 读取方：__schedule (rq_lock 内，无锁)、wakeup (pi_lock 内)。
     state_atomic: AtomicU32,
-    /// 对标 Linux: TASK_WAKEKILL — 仅 fatal signal 可唤醒。
-    /// 在 Linux 中 TASK_WAKEKILL 是 __state 位掩码的一部分，此处用 AtomicBool 独立存储，
+    /// 在 Linux 中 TASK_WAKEKILL 是 __state 位掩码的一部分，仅 fatal signal 可唤醒，此处用 AtomicBool 独立存储，
     /// 使 __schedule 可在 rq_lock 内无锁读取，避免 rq_lock → pi_lock 的 ABBA 死锁。
     wake_kill: AtomicBool,
     /// 对标 Linux: sched_contributes_to_load 的等价标志。
     /// mark_sleep/mark_sleep_killable 设置，__schedule 读取后通过 set_wakeup 清除。
     /// AtomicBool 使 __schedule 无需获取 pi_lock 即可读取。
     mark_sleep: AtomicBool,
-    /// 对标 Linux `task_struct::pi_lock`（raw_spinlock_t）。
     /// 保护 cpus_allowed / nr_cpus_allowed（CPU affinity），
     /// 以及 wakeup 路径与 __schedule 之间的 state 一致性。
     /// 锁序：pi_lock 可嵌套 rq_lock（pi_lock → rq_lock），禁止反向嵌套。
@@ -2925,11 +2937,18 @@ impl ProcessSchedulerInfo {
         self.mark_sleep.store(true, Ordering::Release);
     }
 
-    /// 清除 mark_sleep 和 wake_kill 标志。在 wakeup / wakeup_stop / stop_task / mark_stop 中调用。
-    /// wakeup 路径在 pi_lock 内调用，mark_stop 在当前任务上下文中调用。
+    /// 清除 mark_sleep 和 wake_kill 标志。在 wakeup / wakeup_stop / stop_task 中调用。
+    /// wakeup 路径在 pi_lock 内调用。
     pub fn set_wakeup(&self) {
         self.mark_sleep.store(false, Ordering::Release);
         self.wake_kill.store(false, Ordering::Release);
+    }
+
+    /// 清除 mark_sleep（STOPPED 不是睡眠），设置 wake_kill（致命信号可唤醒）。
+    /// 使 __schedule 中 signal_pending_state() 能检查到 WAKEKILL 位，
+    pub fn set_stop(&self) {
+        self.mark_sleep.store(false, Ordering::Release);
+        self.wake_kill.store(true, Ordering::Release);
     }
 
     pub fn wake_kill(&self) -> bool {

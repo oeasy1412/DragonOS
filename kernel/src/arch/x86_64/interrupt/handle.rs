@@ -45,17 +45,18 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
 
     // 仅当 NEED_SCHEDULE 被设置时才调用 __schedule，
     if current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE) {
-        loop {
-            ProcessManager::preempt_disable();
-            unsafe { CurrentIrqArch::interrupt_enable() };
-            let switched = __schedule(SchedMode::SM_PREEMPT);
-            unsafe { CurrentIrqArch::interrupt_disable() };
-            if !switched {
-                ProcessManager::preempt_enable();
-            }
-            if !need_resched() {
-                break;
-            }
-        }
+        // loop {
+        //     ProcessManager::preempt_disable();
+        //     unsafe { CurrentIrqArch::interrupt_enable() };
+        //     let switched = __schedule(SchedMode::SM_PREEMPT);
+        //     unsafe { CurrentIrqArch::interrupt_disable() };
+        //     if !switched {
+        //         ProcessManager::preempt_enable();
+        //     }
+        //     if !need_resched() {
+        //         break;
+        //     }
+        // }
+        __schedule(SchedMode::SM_PREEMPT);
     }
 }

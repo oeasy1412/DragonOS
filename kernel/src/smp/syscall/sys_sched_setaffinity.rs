@@ -115,7 +115,6 @@ impl Syscall for SysSchedSetaffinity {
             schedule(SchedMode::SM_NONE);
             drop(irq_guard);
         } else {
-            // 对标 Linux __set_cpus_allowed_ptr → task_rq_lock → __set_cpus_allowed_ptr_locked
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
             // 只负责获取 pi_lock + rq_lock 并验证任务未迁移，retry 时不重复设 mask。

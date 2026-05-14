@@ -179,8 +179,7 @@ impl LoadBalancer {
         if let Some(cpu) = cpus_allowed.iter_cpu().next() {
             return cpu;
         }
-        // 空 cpus_allowed 是不变量违反（任务必须至少有一个允许的 CPU）。
-        // 对标 Linux BUG_ON_ONCE(cpumask_empty(&p->cpus_allowed))。
+        // 空 cpus_allowed 违反不变量（任务必须至少有一个允许的 CPU）。
         panic!(
             "select_task_rq: empty cpus_allowed for task, target={:?}, prev_cpu={:?}",
             target, prev_cpu

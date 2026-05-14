@@ -599,57 +599,21 @@ impl Signal {
 /// - `fatal` 表明这个信号是不是致命的(会导致进程退出)
 #[inline]
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
-    // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
-    // 如果不是 fatal 的就只唤醒 stop 的进程来响应
-    // debug!("signal_wake_up");
-    // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
     let state = pcb.sched_info().state();
-    let mut wakeup_ok = true;
+    let mut wakeup_ok = false;
+
     if state.is_blocked_interruptable() {
-        ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
-            wakeup_ok = false;
-            warn!(
-                "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
-                ProcessManager::current_pcb().raw_pid(),
-                pcb.raw_pid(),
-                e
-            );
-        });
+        wakeup_ok = ProcessManager::wakeup(&pcb).is_ok();
     } else if state.is_stopped() {
-        // 对已处于 Stopped 的任务，除非致命信号，否则不要唤醒为 Runnable
-        // SIGCONT 的唤醒在 prepare_signal(SIGCONT) 路径专门处理
-        wakeup_ok = false;
-    } else {
-        wakeup_ok = false;
+        wakeup_ok = fatal && ProcessManager::wakeup_stop(&pcb).is_ok();
     }
 
-    // 强制让目标CPU陷入内核，尽快处理 pending 的信号（包括作业控制停止/继续）
-    // 即使目标任务当前处于 Runnable，也需要 kick 以触发内核路径的 do_signal。
     if wakeup_ok {
-        // log::debug!(
-        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick",
-        //     pcb.raw_pid(),
-        //     state,
-        //     fatal
-        // );
         ProcessManager::kick(&pcb);
     } else if fatal {
-        // log::debug!(
-        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> wakeup+kick",
-        //     pcb.raw_pid(),
-        //     state,
-        //     fatal
-        // );
-        let _r = ProcessManager::wakeup(&pcb).map(|_| {
-            ProcessManager::kick(&pcb);
-        });
-    } else if !state.is_stopped() {
-        // log::debug!(
-        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick only",
-        //     pcb.raw_pid(),
-        //     state,
-        //     fatal
-        // );
+        let _ = ProcessManager::wakeup(&pcb).map(|_| ProcessManager::kick(&pcb));
+    } else {
+        // wake_up_state 失败后总是 kick_process
         ProcessManager::kick(&pcb);
     }
 }

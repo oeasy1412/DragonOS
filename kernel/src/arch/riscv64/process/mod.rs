@@ -211,7 +211,6 @@ impl ProcessManager {
         let prev_arch = SpinLockGuard::leak(prev.arch_info_irqsave()) as *mut ArchPCBInfo;
 
         // preempt_count 归零：schedule + rq lock + 2 arch_info locks = 4 次 preempt_disable。
-        // 对标 x86_64 的 set_preempt_count_val(0) 和 Linux finish_task_switch。
         crate::process::preempt::set_preempt_count_val(0);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);

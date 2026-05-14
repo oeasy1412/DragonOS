@@ -1426,7 +1426,6 @@ impl CfsRunQueue {
         unsafe { se.force_mut() }.set_cfs(Arc::downgrade(&rq.cfs_rq()));
         self.enqueue_entity(&se, EnqueueFlag::ENQUEUE_MIGRATED, rq);
         rq.add_nr_running(1);
-        // 对标 Linux activate_task: enqueue 在前，on_rq=QUEUED 在后
         pcb.sched_info().on_rq.set(OnRq::Queued);
     }
 }

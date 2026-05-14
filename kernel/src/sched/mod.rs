@@ -907,14 +907,26 @@ impl CpuRunQueue {
             {
                 self.dec_nr_iowait();
             }
+            // 新 fork 的 CFS 任务 util_avg 初始为 0（init_entity_runnable_average），
+            // 首次 activate 前需初始化 PELT，此条件仅在 fork 路径触发一次。
+            if pcb.sched_info().policy() == SchedPolicy::CFS
+                && pcb
+                    .sched_info()
+                    .sched_entity()
+                    .avg
+                    .util_avg
+                    .load(Ordering::Relaxed)
+                    == 0
+            {
+                crate::sched::pelt::SchedulerAvg::post_init_entity_util_avg(&pcb);
+            }
+
             let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
             if migrated {
                 flags |= EnqueueFlag::ENQUEUE_MIGRATED;
             }
 
             self.activate_task(&pcb, flags);
-            // 对标 Linux sched_ttwu_pending() core.c:3890:
-            //   ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
             // DragonOS 没有 sched_remote_wakeup 字段，但 migrated 局部变量等价于此判断。
             let wake_flags = if migrated {
                 WakeupFlags::WF_MIGRATED
@@ -1188,21 +1200,8 @@ impl WakeQueue {
 /// 远程唤醒入队。
 /// 将任务放入目标 CPU 的 WakeQueue 并发送 IPI，由目标 CPU 本地处理 activate。
 pub fn ttwu_queue(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId, _wake_flags: WakeupFlags) {
-    // 对标 Linux __ttwu_queue_wakelist：push 到目标 rq 的 wakelist + 发 IPI。
-    // 调用者已保证 cpu 有效（select_task_rq 返回值已处理 INVALID）。
-    //
-    // 额外防护：若目标 CPU 不在任务 cpus_allowed 中，回退到当前 CPU。
-    // 对标 Linux ttwu_queue_cond 中的 cpumask_test_cpu(cpu, p->cpus_ptr) 检查。
-    let dest_cpu = if pcb.sched_info().cpus_allowed().get(cpu) == Some(true) {
-        cpu
-    } else {
-        log::warn!(
-            "ttwu_queue: cpu {:?} not in cpus_allowed for pid={:?}, falling back to current CPU",
-            cpu,
-            pcb.raw_pid()
-        );
-        smp_get_processor_id()
-    };
+    // 调用者已保证 cpu 有效 (select_task_rq 返回值已处理 INVALID)
+    let dest_cpu = cpu;
     let wq = cpu_wakequeue(dest_cpu.data() as usize);
     wq.push(pcb.clone());
     send_resched_ipi(dest_cpu);
@@ -1349,9 +1348,8 @@ pub fn scheduler_tick() {
     }
 }
 
-/// 对标 Linux `trigger_load_balance()`：
 /// 检查时间窗口和 domain 状态，满足条件时通过 workqueue 延迟执行 `rebalance_domains`。
-/// Linux 使用 `raise_softirq(SCHED_SOFTIRQ)`，DragonOS 使用 `schedule_work` 等效。
+/// Linux 使用 `raise_softirq(SCHED_SOFTIRQ)`，DragonOS 暂时使用 `schedule_work` 等效。
 fn trigger_load_balance(rq: &CpuRunQueue) -> Option<(ProcessorId, rebalance::CpuIdleType)> {
     let _sd = rq.sched_domain()?;
 
@@ -1527,9 +1525,8 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
                 );
             } else {
                 // sched_contributes_to_load 和 nr_uninterruptible++ 必须在任务正式离开运行队列之前完成。
-                // TASK_KILLABLE = TASK_UNINTERRUPTIBLE | TASK_WAKEKILL 应贡献负载。
                 let contributes_to_load =
-                    matches!(prev_state, ProcessState::Blocked(false)) || wake_kill;
+                    matches!(prev_state, ProcessState::Blocked(false));
                 if contributes_to_load {
                     prev.flags().insert(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
                     rq.nr_uninterruptible.fetch_add(1, Ordering::Relaxed);
@@ -1602,8 +1599,7 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
 
         // prepare_lock_switch: 对标 Linux，rq lock 在 context_switch 期间持续持有。
         // 由 switch_finish_hook（finish_lock_switch）释放。
-        // 这确保 on_cpu 清除、wakelist 排空等操作在 rq lock 保护下完成，
-        // 防止远程 CPU 在上下文切换窗口中操作本 rq。
+        // 这确保 on_cpu 清除、wakelist 排空等操作在 rq lock 保护下完成，防止远程 CPU 在上下文切换窗口中操作本 rq
         core::mem::forget(guard);
 
         unsafe { ProcessManager::switch_process(prev, next) };
@@ -1617,11 +1613,6 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
         if irq_was_enabled {
             local_irq_enable();
         }
-        assert!(
-            Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
-            "{}",
-            ProcessManager::current_pcb().basic().name()
-        );
         false
     }
 }
@@ -1681,9 +1672,7 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
     // TODO: p->recent_used_cpu = task_cpu(p); 需要在 PCB 中新增该字段，
     //       以对齐 CFS select_task_rq_fair 的快速路径优化。
 
-    // 对标 Linux wake_up_new_task (core.c:4853-4854):
-    // raw_spin_lock_irqsave(&p->pi_lock) → WRITE_ONCE(p->__state, TASK_RUNNING)
-    // 先拿 pi_lock 再设 state，保证锁序与 Linux 一致。
+    // 先拿 pi_lock 再设 state，保证锁序一致。
     let pi_guard = pcb.sched_info().pi_lock_irqsave();
     pcb.sched_info().set_state(ProcessState::Runnable);
     pcb.sched_info().set_wakeup();
@@ -1719,7 +1708,6 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
         // Remote CPU: 对标 Linux ttwu_queue_wakelist
         // SpinLock pi_lock 不会与 rq_lock（同为 SpinLock）产生 ABBA：
         // 两者都是关中断自旋锁，nesting 顺序固定（pi_lock → rq_lock），无需提前释放。
-        crate::sched::pelt::SchedulerAvg::post_init_entity_util_avg(pcb);
         crate::sched::ttwu_queue(pcb, target_cpu, WakeupFlags::WF_FORK);
         return;
     }
