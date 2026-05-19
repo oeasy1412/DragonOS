@@ -96,7 +96,7 @@ impl StatFileOps {
         let mut procs_blocked = 0u64;
         for pid in pids {
             if let Some(pcb) = pid.pid_task(PidType::PID) {
-                let state = pcb.sched_info().inner_lock_read_irqsave().state();
+                let state = pcb.sched_info().state();
                 if state.is_runnable() {
                     procs_running += 1;
                 } else if matches!(state, ProcessState::Blocked(false)) {

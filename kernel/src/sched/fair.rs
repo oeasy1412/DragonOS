@@ -1576,7 +1576,7 @@ impl Scheduler for CompletelyFairScheduler {
         se.force_mut().deadline += se.calculate_delta_fair(se.slice);
     }
 
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<crate::process::ProcessControlBlock>,
         wake_flags: WakeupFlags,

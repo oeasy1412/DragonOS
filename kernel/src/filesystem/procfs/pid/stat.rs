@@ -99,10 +99,8 @@ fn generate_linux_proc_stat_line(
     let cstime: i64 = 0;
 
     // === 读取真实的 priority 和 nice 值 ===
-    let prio_data = pcb.sched_info().prio_data();
-    let priority: i64 = prio_data.prio as i64;
-    let nice: i64 = PrioUtil::prio_to_nice(prio_data.static_prio) as i64;
-    drop(prio_data);
+    let priority: i64 = pcb.sched_info().prio() as i64;
+    let nice: i64 = PrioUtil::prio_to_nice(pcb.sched_info().static_prio()) as i64;
 
     // 线程组中的线程数量
     let num_threads: i64 = pcb
@@ -154,7 +152,7 @@ impl FileOps for StatFileOps {
 
         let comm = pcb.basic().name().to_string();
         let sched = pcb.sched_info();
-        let state = sched.inner_lock_read_irqsave().state();
+        let state = sched.state();
 
         let ppid = pcb
             .parent_pcb()
