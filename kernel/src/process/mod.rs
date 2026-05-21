@@ -66,7 +66,7 @@ use crate::{
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, SchedPolicy, Scheduler, WakeupFlags,
         __schedule_with_current, completion::Completion, cpu_is_online, cpu_rq,
-        enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO, rq_is_idle_cpu, select_task_rq,
+        enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO, select_task_rq,
     },
     smp::{
         core::smp_get_processor_id,
