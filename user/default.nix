@@ -10,6 +10,7 @@
   rootfsType ? "vfat",
   diskPath,
   partitionType ? "mbr",
+  baseImage ? null,
 }:
 
 let
@@ -22,6 +23,7 @@ let
       target
       fenix
       testOpt
+      baseImage
       ;
   };
 
@@ -168,6 +170,8 @@ let
     runtimeInputs = [
       pkgs.coreutils
       pkgs.gnutar
+      pkgs.jq
+      pkgs.rsync
       pkgs.libguestfs-with-appliance
       pkgs.findutils
       pkgs.parted
@@ -177,6 +181,9 @@ let
     ];
     text = ''
       set -euo pipefail
+
+      # 记录起始目录
+      START_DIR="''$(pwd)"
 
       # Ensure build directory exists
       mkdir -p "${buildDir}"
@@ -195,7 +202,50 @@ let
       cd "$TEMP_DIR"
       tar -xzf ${image}
 
-      # 找到 layer.tar 并复制到 bin/
+    ${if baseImage != null then ''
+      # 有 base image 时：按 manifest.json 中 Layers 顺序合并所有层
+      # 策略：先解压 base 层保留符号链接结构，再用 rsync --ignore-existing 叠加增量层
+      # 这样 Ubuntu 的 passwd/group/shadow 等文件被保留，DragonOS 只添加新增文件
+      echo "  Merging layers from base image + DragonOS apps..."
+      LAYERS=$(jq -r '.[].Layers[]' manifest.json)
+      if [ -z "$LAYERS" ]; then
+        echo "Error: no layers found in manifest.json"
+        exit 1
+      fi
+
+      MERGE_DIR=$(mktemp -d)
+      LAYER_IDX=0
+      for layer in $LAYERS; do
+        echo "    Applying layer: $layer"
+        if [ "$LAYER_IDX" -eq 0 ]; then
+          # 第一层（base image）：直接解压到合并目录，保留符号链接
+          tar -xf "$layer" -C "$MERGE_DIR"
+        else
+          # 增量层：解压到临时目录，用 rsync --ignore-existing 叠加
+          # --ignore-existing 保留 base 层已有的文件（如 Ubuntu 的 passwd/group），
+          # 只添加 base 中不存在的新文件（如 DragonOS 的 busybox、测试程序等）
+          LAYER_DIR=$(mktemp -d)
+          tar -xf "$layer" -C "$LAYER_DIR" --exclude='/nix' --exclude='./nix' || true
+          rm -rf "$LAYER_DIR/nix" 2>/dev/null || true
+          rsync -a --ignore-existing "$LAYER_DIR"/ "$MERGE_DIR"/ || true
+          chmod -R +w "$LAYER_DIR" 2>/dev/null || true
+          rm -rf "$LAYER_DIR" 2>/dev/null || true
+        fi
+        LAYER_IDX=$((LAYER_IDX + 1))
+      done
+
+      # 清理可能残留的 nix 目录
+      rm -rf "$MERGE_DIR/nix" 2>/dev/null || true
+
+      # 输出到 MERGE_DIR 外面，避免 bin -> usr/bin 符号链接导致路径冲突
+      cd "$START_DIR"
+      ROOTFS_TMP=$(mktemp -u --tmpdir=. rootfs-XXXXXX.tar)
+      tar -cf "$ROOTFS_TMP" -C "$MERGE_DIR" .
+      mv "$ROOTFS_TMP" "$OUTPUT_TAR"
+      chmod -R +w "$MERGE_DIR" 2>/dev/null || true
+      rm -rf "$MERGE_DIR"
+    '' else ''
+      # 无 base image 时：单层，直接取 layer.tar
       LAYER_TAR=$(find . -name "layer.tar" | head -1)
       if [ -z "$LAYER_TAR" ]; then
         echo "Error: layer.tar not found in docker image"
@@ -204,6 +254,8 @@ let
 
       cp "$LAYER_TAR" "$OLDPWD/$OUTPUT_TAR"
       cd "$OLDPWD"
+    ''}
+
       chmod +w "$OUTPUT_TAR"
 
       TAR_SIZE=$(du -h "$OUTPUT_TAR" | cut -f1)

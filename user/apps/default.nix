@@ -6,6 +6,7 @@
   target,
   fenix,
   testOpt,
+  baseImage ? null,
 }:
 
 # Return a list of app derivations to be copied into the rootfs.
@@ -71,8 +72,11 @@ in
   })
   static.curl
   static.dropbear
+]
+++ lib.optionals (baseImage == null) [
   cross.glibc
-
+]
+++ [
   # Simple C utilities
   (static.callPackage ./about { })
   (static.callPackage ./c_unitest { inherit target; })

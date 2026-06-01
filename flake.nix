@@ -121,10 +121,30 @@
             };
           };
 
+          # Ubuntu 24.04 base image (固定版本，可再现)
+          # 更新方法: nix-prefetch-docker --image-name ubuntu --image-tag 24.04
+          ubuntu2404Base = pkgs.dockerTools.pullImage {
+            imageName = "ubuntu";
+            imageDigest = "sha256:c35e29c9450151419d9448b0fd75374fec4fff364a27f176fb458d472dfc9e54";
+            sha256 = "sha256-EK+i/MqzvUGEGq2NiKnfqA49kYQj6ST8JudBUDgcBoA=";
+            os = "linux";
+            arch = "amd64";
+          };
+
           mkOutputs =
-            target:
+            {
+              target,
+              baseImage ? null,
+              suffix ? "",
+            }:
             let
-              diskPath = "${buildDir}/disk-image-${target}.img";
+              targetName = "${target}${suffix}";
+              diskPath = "${buildDir}/disk-image-${targetName}.img";
+              effectiveRootfsType =
+                if baseImage != null then
+                  "ext4" # Ubuntu base 强制 ext4（vfat 不支持符号链接）
+                else
+                  rootfsType;
               # vsock 固定配置（nix run .#start-* / .#yolo-* 生效）：
               # - guestCid 不能为 2（host CID）
               vsockConfig = {
@@ -201,10 +221,11 @@
                   system
                   target
                   testOpt
-                  rootfsType
                   buildDir
                   diskPath
+                  baseImage
                   ;
+                rootfsType = effectiveRootfsType;
               };
 
               gdbBin = if target == "x86_64" then "rust-gdb" else "gdb-multiarch";
@@ -235,65 +256,73 @@
                 ${pkgs.gnumake}/bin/make kernel
 
                 echo "==> Step 2: Building rootfs (re-evaluating userland packages)..."
-                ${pkgs.nix}/bin/nix run .#rootfs-${target}
+                ${pkgs.nix}/bin/nix run .#rootfs-${targetName}
 
                 echo "==> Step 3: Starting DragonOS..."
-                exec ${pkgs.nix}/bin/nix run .#start-${target} -- "$@"
+                exec ${pkgs.nix}/bin/nix run .#start-${targetName} -- "$@"
               '';
             in
             {
               apps = {
-                # yolo-${target}: 一键化构建启动命令 (make kernel + rootfs + start)
-                "yolo-${target}" = {
+                # yolo-${targetName}: 一键化构建启动命令 (make kernel + rootfs + start)
+                "yolo-${targetName}" = {
                   type = "app";
                   program = "${runApp}/bin/dragonos-yolo";
-                  meta.description = "一键化构建并启动DragonOS (${target})";
+                  meta.description = "一键化构建并启动DragonOS (${targetName})";
                 };
-                # start-${target} 的产物只是一个shell脚本，因此启动相关的参数，直接在上面修改即可，
+                # start-${targetName} 的产物只是一个shell脚本，因此启动相关的参数，直接在上面修改即可，
                 # 脚本不占什么空间所以重复eval也没关系，并且最终产出的脚本可读性更好.
-                "start-${target}" = {
+                "start-${targetName}" = {
                   type = "app";
                   program = "${startPkg}/bin/dragonos-run";
-                  meta.description = "以 ${target} 启动DragonOS";
+                  meta.description = "以 ${targetName} 启动DragonOS";
                 };
-                "start-system-${target}" = {
+                "start-system-${targetName}" = {
                   type = "app";
                   program = "${startSystemPkg}/bin/dragonos-run";
-                  meta.description = "以系统 QEMU 启动DragonOS (${target})";
+                  meta.description = "以系统 QEMU 启动DragonOS (${targetName})";
                 };
-                "start-debug-${target}" = {
+                "start-debug-${targetName}" = {
                   type = "app";
                   program = "${startDebugPkg}/bin/dragonos-run";
-                  meta.description = "以调试模式启动DragonOS (开启GDB stub, ${target})";
+                  meta.description = "以调试模式启动DragonOS (开启GDB stub, ${targetName})";
                 };
                 # rootfs 中涉及到基于docker镜像的rootfs构建，修改了 user/ 下软件包相关内容后，
                 # rootfs 的docker镜像会重复构建，并且由于nix特性，副本会全部保留
                 # 因此可能会占很多空间，如果要清理空间请执行 nix store gc
-                "rootfs-${target}" = {
+                "rootfs-${targetName}" = {
                   type = "app";
                   program = "${rootfsPkg}/bin/dragonos-rootfs";
-                  meta.description = "构建 ${target} rootfs 镜像";
+                  meta.description = "构建 ${targetName} rootfs 镜像";
                 };
-                "gdb-${target}" = {
+                "gdb-${targetName}" = {
                   type = "app";
                   program = "${gdbScript}/bin/dragonos-gdb";
-                  meta.description = "Connect GDB to running DragonOS (${target})";
+                  meta.description = "Connect GDB to running DragonOS (${targetName})";
                 };
               };
               packages = {
-                "yolo-${target}" = runApp;
-                "start-${target}" = startPkg;
-                "start-system-${target}" = startSystemPkg;
-                "start-debug-${target}" = startDebugPkg;
-                "rootfs-${target}" = rootfsPkg;
-                "gdb-${target}" = gdbScript;
+                "yolo-${targetName}" = runApp;
+                "start-${targetName}" = startPkg;
+                "start-system-${targetName}" = startSystemPkg;
+                "start-debug-${targetName}" = startDebugPkg;
+                "rootfs-${targetName}" = rootfsPkg;
+                "gdb-${targetName}" = gdbScript;
               };
             };
 
-          allOutputs = map mkOutputs [
-            "x86_64"
-            "riscv64"
-          ];
+          allOutputs =
+            (map (t: mkOutputs { target = t; }) [
+              "x86_64"
+              "riscv64"
+            ])
+            ++ [
+              (mkOutputs {
+                target = "x86_64";
+                baseImage = ubuntu2404Base;
+                suffix = "-ubuntu";
+              })
+            ];
           merged =
             lib.foldl'
               (acc: elem: {
