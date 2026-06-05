@@ -6,7 +6,8 @@ use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 
 use crate::{
     process::{ProcessFlags, ProcessManager},
-    smp::cpu::ProcessorId,
+    sched::cpu_rq,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 use super::{
@@ -68,7 +69,16 @@ impl IrqHandler for KickCpuIpiHandler {
         #[cfg(target_arch = "x86_64")]
         CurrentApic.send_eoi();
 
-        // 被其他 CPU kick 时只挂起抢占请求，实际调度由顶层中断出口在
+        // EOI 必须在 rq_lock 之前，避免死锁。
+        {
+            let cpu = smp_get_processor_id();
+            let rq = cpu_rq(cpu.data() as usize);
+            let (rq_mut, guard) = rq.self_lock();
+            rq_mut.drain_wake_queue();
+            drop(guard);
+        }
+
+        // 被其他 CPU kick 时挂起抢占请求，实际调度由顶层中断出口在
         // RCU IRQ 上下文结束后统一执行。
         ProcessManager::current_pcb()
             .flags()

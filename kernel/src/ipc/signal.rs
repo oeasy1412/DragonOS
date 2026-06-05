@@ -1,13 +1,3 @@
-use core::{
-    fmt::Debug,
-    intrinsics::unlikely,
-    sync::atomic::{compiler_fence, Ordering},
-};
-
-use alloc::sync::Arc;
-use log::warn;
-use system_error::SystemError;
-
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     ipc::signal_types::{
@@ -24,6 +14,14 @@ use crate::{
         PosixTimeSpec,
     },
 };
+use alloc::sync::Arc;
+use core::{
+    fmt::Debug,
+    intrinsics::unlikely,
+    sync::atomic::{compiler_fence, Ordering},
+};
+use log::warn;
+use system_error::SystemError;
 
 /// Send a kernel-originated signal to the current task.
 ///
@@ -727,9 +725,16 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
         //     state,
         //     fatal
         // );
-        let _r = ProcessManager::wakeup(&pcb).map(|_| {
-            ProcessManager::kick(&pcb);
-        });
+        if state.is_stopped() {
+            // SIGKILL 唤醒 Stopped 任务必须走 wakeup_stop，wakeup() 对 Stopped 状态不处理
+            let _r = ProcessManager::wakeup_stop(&pcb).map(|_| {
+                ProcessManager::kick(&pcb);
+            });
+        } else {
+            let _r = ProcessManager::wakeup(&pcb).map(|_| {
+                ProcessManager::kick(&pcb);
+            });
+        }
     } else if !state.is_stopped() {
         // log::debug!(
         //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick only",

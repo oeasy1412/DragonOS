@@ -1,38 +1,33 @@
-use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
-
-use crate::arch::MMArch;
-use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src};
-use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
-use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::FileType;
-use crate::filesystem::vfs::InodeMode;
-use crate::mm::access_ok;
-use crate::mm::MemoryManagementArch;
-use crate::process::pid::PidPrivateData;
-use alloc::{string::ToString, sync::Arc};
-use log::{error, warn};
-use system_error::SystemError;
-
-use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal},
-    ipc::signal_types::SignalFlags,
-    libs::{cpumask::CpuMask, rwsem::RwSem},
-    mm::VirtAddr,
-    process::ProcessFlags,
-    sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
-    smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
-    syscall::user_access::UserBufferWriter,
-};
-
 use super::{
     account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
-    pid::{Pid, PidType},
-    KernelStack, ProcessControlBlock, ProcessManager, RawPid,
+    pid::{Pid, PidPrivateData, PidType},
+    KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
 };
+use crate::{
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
+    cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src},
+    filesystem::{
+        cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node},
+        vfs::{
+            file::{File, FileFlags, FilePrivateData},
+            FileType, InodeMode,
+        },
+    },
+    ipc::signal_types::SignalFlags,
+    libs::{cpumask::CpuMask, rwsem::RwSem},
+    mm::{access_ok, MemoryManagementArch, VirtAddr},
+    sched::{cpu_is_online, sched_cgroup_fork, sched_fork, wake_up_new_task},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager_initialized, ProcessorId},
+    },
+    syscall::user_access::UserBufferWriter,
+};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
+use log::{error, warn};
+use system_error::SystemError;
+
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
 bitflags! {
@@ -170,13 +165,13 @@ impl KernelCloneArgs {
     }
 
     #[inline]
-    fn target_cpu_is_allowed(cpu: ProcessorId, allowed: &CpuMask) -> bool {
+    fn target_cpu_is_allowed(allowed: &CpuMask, cpu: ProcessorId) -> bool {
         allowed.get(cpu).unwrap_or(false)
     }
 
     #[inline]
     fn validate_target_cpu(cpu: ProcessorId, allowed: &CpuMask) -> Result<(), SystemError> {
-        if Self::target_cpu_is_allowed(cpu, allowed) && Self::target_cpu_is_online(cpu) {
+        if Self::target_cpu_is_allowed(allowed, cpu) && Self::target_cpu_is_online(cpu) {
             Ok(())
         } else {
             Err(SystemError::EINVAL)
@@ -202,7 +197,7 @@ impl KernelCloneArgs {
         let target_cpu = if let Some(target_cpu) = self.target_cpu {
             Self::validate_target_cpu(target_cpu, allowed)?;
             target_cpu
-        } else if Self::target_cpu_is_allowed(default_cpu, allowed)
+        } else if Self::target_cpu_is_allowed(allowed, default_cpu)
             && Self::target_cpu_is_online(default_cpu)
         {
             default_cpu
@@ -280,6 +275,7 @@ impl ProcessManager {
             );
             e
         })?;
+
         // if pcb.raw_pid().data() > 1 {
         //     log::debug!(
         //         "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
@@ -290,13 +286,8 @@ impl ProcessManager {
         //     );
         // }
 
-        ProcessManager::wake_up_new_task(&pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
-                pcb.raw_pid(),
-                e
-            )
-        });
+        // 一次 select_task_rq(WF_FORK) + activate_task
+        wake_up_new_task(&pcb);
 
         if ProcessManager::current_pid().data() == 0 {
             return Ok(pcb.raw_pid());
@@ -392,6 +383,8 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
             new_pcb.replace_sighand(current_pcb.sighand());
+            // TODO: CLONE_SIGHAND 意味着新线程共享 sighand（即同一线程组），递增 live 计数。
+            // current_pcb.sighand().live.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             return Ok(());
         }
 
@@ -730,12 +723,12 @@ impl ProcessManager {
             // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
             let ns = pcb.nsproxy().pid_namespace_for_children().clone();
 
-            let main_pid_arc = alloc_pid(&ns)?;
+            let main_pid_arc = alloc_pid(&ns).expect("alloc_pid failed");
 
             // 根namespace中的PID号作为RawPid
             let root_pid_nr = main_pid_arc
                 .first_upid()
-                .ok_or(SystemError::EINVAL)?
+                .expect("UPid list empty")
                 .nr
                 .data();
             // log::debug!("fork: root_pid_nr: {}", root_pid_nr);
@@ -776,7 +769,7 @@ impl ProcessManager {
             *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
             *pcb.real_parent_pcb.write_irqsave() =
                 current_pcb.real_parent_pcb.read_irqsave().clone();
-            pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+            pcb.set_exit_signal(Signal::INVALID);
         } else {
             if clone_flags.contains(CloneFlags::CLONE_PARENT) {
                 *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
@@ -786,8 +779,7 @@ impl ProcessManager {
                 *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
                 *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
             }
-            pcb.exit_signal
-                .store(clone_args.exit_signal, Ordering::SeqCst);
+            pcb.set_exit_signal(clone_args.exit_signal);
 
             if let Some(parent) = pcb.parent_pcb() {
                 let ppid_in_child_ns = parent
@@ -948,9 +940,20 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        // 新任务的默认落点 CPU 应在 wake_up_new_task() 时再选择；这里只保留显式 hint，
-        // 以避免 fork 长路径内父任务迁移导致的“过早采样当前 CPU”问题。
-        pcb.sched_info().mark_new_task(clone_args.target_cpu);
+        // 将子进程/线程的id存储在用户态传进的地址中
+        if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+            let mut writer = UserBufferWriter::new(
+                clone_args.parent_tid.data() as *mut i32,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
+
+            writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
+        }
+
+        // 验证 cpus_allowed 中有可用的在线 CPU
+        clone_args.resolve_target_cpu(smp_get_processor_id(), &pcb.sched_info().cpus_allowed())?;
+        // sched_cgroup_fork: 绑定到父 CPU + task_fork（不做负载均衡）
         sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态

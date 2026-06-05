@@ -20,7 +20,7 @@ pub fn fifo_demo_init() {
         pcb.sched_info().set_on_cpu(Some(ProcessorId::new(0)));
 
         // 设置调度策略为FIFO，优先级为50
-        ProcessManager::set_fifo_policy(&pcb, MAX_RT_PRIO - 50).expect("Failed to set FIFO policy");
+        ProcessManager::set_fifo_policy(&pcb, MAX_RT_PRIO / 2).expect("Failed to set FIFO policy");
 
         loop {
             log::info!("fifo is running");

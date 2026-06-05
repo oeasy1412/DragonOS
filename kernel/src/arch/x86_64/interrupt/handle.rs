@@ -3,7 +3,7 @@ use core::intrinsics::likely;
 use crate::{
     arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
-    process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
+    process::{preempt::preempt_count_val, utils::current_pcb_flags, ProcessFlags, ProcessManager},
     sched::{SchedMode, SchedPolicy, __schedule},
 };
 
@@ -44,7 +44,13 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
         && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
     crate::rcu::irq_exit(resume_idle_eqs);
 
-    if should_schedule {
-        __schedule(SchedMode::SM_PREEMPT);
+    if should_schedule && preempt_count_val() == 0 {
+        // preempt_disable 保证 switch_finish_hook 入口 preempt_count == 2；
+        // 若 __schedule bail out（持锁不可抢占），必须 preempt_enable 以平衡。
+        ProcessManager::preempt_disable();
+        let switched = __schedule(SchedMode::SM_PREEMPT);
+        if !switched {
+            ProcessManager::preempt_enable();
+        }
     }
 }

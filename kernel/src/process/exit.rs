@@ -1,5 +1,5 @@
 use alloc::sync::{Arc, Weak};
-use core::{intrinsics::likely, sync::atomic::Ordering};
+use core::intrinsics::likely;
 use system_error::SystemError;
 
 use crate::{
@@ -70,7 +70,7 @@ fn child_matches_wait_options(child_pcb: &Arc<ProcessControlBlock>, options: Wai
         return true;
     }
 
-    let child_exit_signal = child_pcb.exit_signal.load(Ordering::SeqCst);
+    let child_exit_signal = child_pcb.exit_signal();
     let is_clone_child = child_exit_signal != Signal::SIGCHLD;
     let wants_clone = options.contains(WaitOption::WCLONE);
 

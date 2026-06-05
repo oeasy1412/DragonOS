@@ -208,12 +208,12 @@ impl ProcessManager {
         // debug!("current sum={}, prev sum={}, next_sum={}", riscv::register::sstatus::read().sum(), prev.arch_info_irqsave().sstatus.sum(), next.arch_info_irqsave().sstatus.sum());
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）
-        let next_arch = SpinLockGuard::leak(next.arch_info_irqsave()) as *mut ArchPCBInfo;
-        let prev_arch = SpinLockGuard::leak(prev.arch_info_irqsave()) as *mut ArchPCBInfo;
+        let next_arch =
+            SpinLockGuard::leak(unsafe { next.arch_info_irqsave_no_preempt() }) as *mut ArchPCBInfo;
+        let prev_arch =
+            SpinLockGuard::leak(unsafe { prev.arch_info_irqsave_no_preempt() }) as *mut ArchPCBInfo;
 
-        // 恢复当前的 preempt count*2
-        ProcessManager::current_pcb().preempt_enable();
-        ProcessManager::current_pcb().preempt_enable();
+        // per-CPU：preempt_count 由 switch_finish_hook 统一重置，无需在 switch_process 中操作。
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // debug!("riscv switch process: before to inner");

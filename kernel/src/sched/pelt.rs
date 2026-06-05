@@ -1,4 +1,5 @@
 use core::intrinsics::unlikely;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
 
@@ -33,9 +34,9 @@ pub struct SchedulerAvg {
     /// 记录周期性任务的贡献值，用于计算平均CPU利用率
     pub period_contrib: u32,
 
-    pub load_avg: usize,
-    pub runnable_avg: usize,
-    pub util_avg: usize,
+    pub load_avg: AtomicUsize,
+    pub runnable_avg: AtomicUsize,
+    pub util_avg: AtomicUsize,
 }
 
 impl SchedulerAvg {
@@ -107,7 +108,7 @@ impl SchedulerAvg {
             self.load_sum += (contrib * load) as u64;
         }
         if runnable > 0 {
-            self.runnable_sum += (runnable & contrib << SCHED_CAPACITY_SHIFT) as u64;
+            self.runnable_sum += ((runnable as u64) * (contrib as u64)) << SCHED_CAPACITY_SHIFT;
         }
 
         if running > 0 {
@@ -118,7 +119,7 @@ impl SchedulerAvg {
     }
 
     fn decay_load(mut val: u64, n: u64) -> u64 {
-        if unlikely(n > LOAD_AVG_PERIOD) {
+        if unlikely(n > LOAD_AVG_PERIOD * 63) {
             return 0;
         }
 
@@ -129,7 +130,7 @@ impl SchedulerAvg {
             local_n %= LOAD_AVG_PERIOD;
         }
 
-        ((val as i128 * RUNNABLE_AVG_Y_N_INV[local_n as usize] as i128) >> 32) as u64
+        ((val as u128 * RUNNABLE_AVG_Y_N_INV[local_n as usize] as u128) >> 32) as u64
     }
 
     fn accumulate_pelt_segments(periods: u64, d1: u32, d3: u32) -> u32 {
@@ -158,46 +159,75 @@ impl SchedulerAvg {
     pub fn update_load_avg(&mut self, load: u64) {
         let divider = self.get_pelt_divider();
 
-        self.load_avg = (load * self.load_sum) as usize / divider;
-        self.runnable_avg = self.runnable_sum as usize / divider;
-        self.util_avg = self.util_sum as usize / divider;
+        self.load_avg
+            .store((load * self.load_sum) as usize / divider, Ordering::Relaxed);
+        self.runnable_avg
+            .store(self.runnable_sum as usize / divider, Ordering::Relaxed);
+        self.util_avg
+            .store(self.util_sum as usize / divider, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
+    /// 为新 fork 的 task 初始化 PELT 平均值
+    /// 对于非 CFS 策略，只记录 last_update_time 后立即返回
+    /// 对于 CFS 策略，根据当前 cfs_rq 的负载比例初始化 util_avg / runnable_avg
     pub fn post_init_entity_util_avg(pcb: &Arc<ProcessControlBlock>) {
         let se = pcb.sched_info().sched_entity();
         let cfs_rq = se.cfs_rq();
-        let sa = &mut se.force_mut().avg;
+        let sa = &mut unsafe { se.force_mut() }.avg;
 
         // TODO: 这里和架构相关
         let cpu_scale = SCHED_CAPACITY_SCALE;
 
-        let cap = (cpu_scale as isize - cfs_rq.avg.util_avg as isize) / 2;
-
+        // 非 fair 类只设置 last_update_time 后返回
         if pcb.sched_info().policy() != SchedPolicy::CFS {
             sa.last_update_time = cfs_rq.cfs_rq_clock_pelt();
+            return;
         }
 
-        if cap > 0 {
-            if cfs_rq.avg.util_avg != 0 {
-                sa.util_avg = cfs_rq.avg.util_avg * se.load.weight as usize;
-                sa.util_avg /= cfs_rq.avg.load_avg + 1;
+        let cap = (cpu_scale as isize - cfs_rq.avg.util_avg.load(Ordering::Relaxed) as isize) / 2;
 
-                if sa.util_avg as isize > cap {
-                    sa.util_avg = cap as usize;
+        if cap > 0 {
+            if cfs_rq.avg.util_avg.load(Ordering::Relaxed) != 0 {
+                let mut util =
+                    cfs_rq.avg.util_avg.load(Ordering::Relaxed) * se.load.weight as usize;
+                util /= cfs_rq.avg.load_avg.load(Ordering::Relaxed) + 1;
+
+                if util as isize > cap {
+                    util = cap as usize;
                 }
+                sa.util_avg.store(util, Ordering::Relaxed);
             } else {
-                sa.util_avg = cap as usize;
+                sa.util_avg.store(cap as usize, Ordering::Relaxed);
             }
         }
 
-        sa.runnable_avg = sa.util_avg;
+        sa.runnable_avg
+            .store(sa.util_avg.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 }
 
 impl CpuRunQueue {
     pub fn rq_clock_pelt(&self) -> u64 {
         self.clock_pelt - self.lost_idle_time
+    }
+
+    /// 更新 PELT 时钟（对标 Linux pelt.h update_rq_clock_pelt）
+    ///
+    /// 当 rq idle 时，将 clock_pelt 同步到 clock_task，
+    /// 防止 idle 时间被计入 PELT 负载。
+    /// 当 rq running 时，推进 clock_pelt。
+    ///
+    /// Linux 还有 cap_scale（CPU 容量/频率缩放），DragonOS 对称 SMP 下
+    /// cap_scale(v, 1024) = (v * 1024) >> 10 = v（恒等变换），可省略。
+    pub fn update_rq_clock_pelt(&mut self, delta: u64) {
+        let is_idle = self.current().sched_info().policy() == SchedPolicy::IDLE;
+
+        if is_idle {
+            self.clock_pelt = self.clock_task;
+            return;
+        }
+
+        self.clock_pelt += delta;
     }
 }
 
@@ -208,7 +238,6 @@ impl CfsRunQueue {
         }
 
         let rq = self.rq();
-        let rq = rq.force_mut_locked();
 
         return rq.rq_clock_pelt() - self.throttled_clock_pelt_time;
     }
@@ -249,12 +278,4 @@ bitflags! {
 pub fn add_positive(x: &mut isize, y: isize) {
     let res = *x + y;
     *x = res.max(0);
-}
-
-pub fn sub_positive(x: &mut usize, y: usize) {
-    if *x > y {
-        *x -= y;
-    } else {
-        *x = 0;
-    }
 }

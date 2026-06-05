@@ -17,3 +17,17 @@ pub fn local_irq_restore(x: usize) {
         asm!("push {}; popfq", in(reg) x, options(nomem, preserves_flags));
     }
 }
+
+#[inline]
+pub fn local_irq_disable() {
+    unsafe {
+        asm!("cli", options(nomem, preserves_flags));
+    }
+}
+
+#[inline]
+pub fn local_irq_enable() {
+    unsafe {
+        asm!("sti", options(nomem, preserves_flags));
+    }
+}

@@ -115,7 +115,7 @@ macro_rules! define_event_trace{
                 let common = $crate::tracepoint::TraceEntry {
                     type_: [<__ $name>].id() as _,
                     flags: [<__ $name>].flags(),
-                    preempt_count: 0,
+                    preempt_count: $crate::process::preempt::preempt_count_val() as u8,
                     pid,
                 };
 

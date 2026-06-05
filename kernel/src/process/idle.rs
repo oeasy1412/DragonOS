@@ -69,19 +69,15 @@ impl ProcessManager {
 
             // 在双锁保护下设置 cpus_allowed 和 task_cpu
             pi_guard.set_cpus_allowed(CpuMask::from_cpu(ProcessorId::new(i)));
-            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
 
-            rq.set_current(Arc::downgrade(&idle_pcb));
+            // __set_task_cpu under rq_lock, before on_rq=Queued (core.c:9295)
+            crate::sched::__set_task_cpu(&idle_pcb, ProcessorId::new(i));
+
             rq.set_idle(Arc::downgrade(&idle_pcb));
+            rq.set_current(idle_pcb.clone());
             IDLE_CPUS.set(ProcessorId::new(i));
-
-            *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
-
-            idle_pcb
-                .sched_info()
-                .sched_entity()
-                .force_mut()
-                .set_cfs(Arc::downgrade(&rq.cfs_rq()));
+            idle_pcb.sched_info().on_rq.set(OnRq::Queued);
+            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
 
             // 释放顺序：先 rq_lock，再 pi_lock
             drop(rq_guard);

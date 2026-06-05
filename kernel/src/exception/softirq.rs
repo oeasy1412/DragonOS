@@ -1,3 +1,17 @@
+use crate::{
+    arch::CurrentIrqArch,
+    exception::{bottom_half, InterruptArch},
+    libs::rwlock::RwLock,
+    mm::percpu::{PerCpu, PerCpuVar},
+    process::{
+        preempt::{preempt_count_val, set_preempt_count_val},
+        ProcessManager,
+    },
+    sched::cputime::IrqTime,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    time::timer::clock,
+};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
@@ -5,23 +19,9 @@ use core::{
     ptr::null_mut,
     sync::atomic::{compiler_fence, fence, AtomicI16, Ordering},
 };
-
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use log::{debug, info};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
-
-use crate::{
-    arch::CurrentIrqArch,
-    exception::bottom_half,
-    exception::InterruptArch,
-    libs::rwlock::RwLock,
-    mm::percpu::{PerCpu, PerCpuVar},
-    process::ProcessManager,
-    sched::cputime::IrqTime,
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
-    time::timer::clock,
-};
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
 const MAX_SOFTIRQ_RESTART: i32 = 20;
@@ -213,17 +213,17 @@ impl Softirq {
                         continue;
                     }
 
-                    let prev_count: usize = ProcessManager::current_pcb().preempt_count();
+                    let prev_count = preempt_count_val();
 
                     softirq_func.as_ref().unwrap().run();
-                    if unlikely(prev_count != ProcessManager::current_pcb().preempt_count()) {
+                    if unlikely(prev_count != preempt_count_val()) {
                         debug!(
                             "entered softirq {:?} with preempt_count {:?},exited with {:?}",
                             i,
                             prev_count,
-                            ProcessManager::current_pcb().preempt_count()
+                            preempt_count_val()
                         );
-                        unsafe { ProcessManager::current_pcb().set_preempt_count(prev_count) };
+                        set_preempt_count_val(prev_count);
                     }
                 }
             }

@@ -12,6 +12,20 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU8, Ordering},
 };
 
+use super::spinlock::{SpinLock, SpinLockGuard};
+use crate::{
+    arch::{ipc::signal::Signal, CurrentIrqArch},
+    exception::InterruptArch,
+    libs::mutex::MutexGuard,
+    process::{
+        preempt::preempt_count_val, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState,
+    },
+    sched::{io_schedule, schedule, SchedMode},
+    time::{
+        timer::{next_n_us_timer_jiffies, Timer},
+        Duration, Instant,
+    },
+};
 use alloc::{
     boxed::Box,
     collections::VecDeque,
@@ -21,20 +35,6 @@ use alloc::{
 };
 use log::warn;
 use system_error::SystemError;
-
-use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch},
-    exception::InterruptArch,
-    libs::mutex::MutexGuard,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
-    sched::{io_schedule, schedule, SchedMode},
-    time::{
-        timer::{next_n_us_timer_jiffies, Timer},
-        Duration, Instant,
-    },
-};
-
-use super::spinlock::{SpinLock, SpinLockGuard};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum WaitSignalMode {
@@ -719,9 +719,6 @@ impl Waker {
                         )
                         .is_ok()
                     {
-                        if let Some(pcb) = self.target.upgrade() {
-                            let _ = ProcessManager::wakeup(&pcb);
-                        }
                         return true;
                     }
                 }
@@ -811,12 +808,13 @@ enum WakerSleepState {
 }
 
 fn before_sleep_check(max_preempt: usize) {
-    let pcb = ProcessManager::current_pcb();
-    if unlikely(pcb.preempt_count() > max_preempt) {
+    let count = preempt_count_val();
+    if unlikely(count > max_preempt) {
+        let pcb = ProcessManager::current_pcb();
         warn!(
             "Process {:?}: Try to sleep when preempt count is {}",
             pcb.raw_pid().data(),
-            pcb.preempt_count()
+            count
         );
     }
 }
@@ -859,6 +857,7 @@ fn block_current_impl(
             let pcb = ProcessManager::current_pcb();
             if pcb.sched_info().state().is_blocked() {
                 pcb.sched_info().set_state(ProcessState::Runnable);
+                pcb.sched_info().set_wakeup();
             }
             pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
             drop(irq_guard);
@@ -897,12 +896,13 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
             WakerSleepState::Sleeping => {}
         }
 
-        ProcessManager::mark_sleep(true)?;
+        ProcessManager::mark_sleep_killable()?;
 
         if waiter.waker.consume_notification() {
             let pcb = ProcessManager::current_pcb();
             if pcb.sched_info().state().is_blocked() {
                 pcb.sched_info().set_state(ProcessState::Runnable);
+                pcb.sched_info().set_wakeup();
             }
             pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
             drop(irq_guard);

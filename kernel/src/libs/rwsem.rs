@@ -2,6 +2,8 @@
 //
 // Sleepable Read-Write Semaphore (RwSem)
 
+use super::wait_queue::{WaitQueue, Waiter};
+use alloc::rc::Rc;
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
@@ -11,13 +13,7 @@ use core::{
         Ordering::{AcqRel, Acquire, Relaxed, Release},
     },
 };
-
-use alloc::rc::Rc;
 use system_error::SystemError;
-
-use crate::process::ProcessManager;
-
-use super::wait_queue::{WaitQueue, Waiter};
 
 /// A mutex that provides data access to either one writer or many readers.
 ///
@@ -124,7 +120,7 @@ impl<T: ?Sized> RwSem<T> {
     /// or readers present.
     #[track_caller]
     pub fn write(&self) -> RwSemWriteGuard<'_, T> {
-        if self.waiters.load(Acquire) == 0 || ProcessManager::current_pcb().preempt_count() != 0 {
+        if self.waiters.load(Acquire) == 0 || crate::process::preempt::preempt_count_val() != 0 {
             if let Some(guard) = self.try_write() {
                 return guard;
             }
@@ -156,7 +152,7 @@ impl<T: ?Sized> RwSem<T> {
 
     /// Blocking write acquire (interruptible).
     pub fn write_interruptible(&self) -> Result<RwSemWriteGuard<'_, T>, SystemError> {
-        if self.waiters.load(Acquire) == 0 || ProcessManager::current_pcb().preempt_count() != 0 {
+        if self.waiters.load(Acquire) == 0 || crate::process::preempt::preempt_count_val() != 0 {
             if let Some(guard) = self.try_write() {
                 return Ok(guard);
             }

@@ -1,7 +1,6 @@
+use crate::sched::fair::FairSchedEntity;
 use alloc::{boxed::Box, sync::Arc};
 use core::cmp::{max, Ordering};
-
-use crate::sched::fair::FairSchedEntity;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct EntityKey {
@@ -55,7 +54,7 @@ impl FairTreeNode {
     fn new(entity: Arc<FairSchedEntity>) -> Box<Self> {
         let key = EntityKey::new(&entity);
         let min_deadline = entity.deadline;
-        entity.force_mut().min_deadline = min_deadline;
+        unsafe { entity.force_mut() }.min_deadline = min_deadline;
 
         Box::new(Self {
             key,
@@ -93,7 +92,7 @@ impl FairTreeNode {
         }
 
         self.min_deadline = min_deadline;
-        self.entity.force_mut().min_deadline = min_deadline;
+        unsafe { self.entity.force_mut() }.min_deadline = min_deadline;
     }
 
     fn balance_factor(&self) -> i32 {

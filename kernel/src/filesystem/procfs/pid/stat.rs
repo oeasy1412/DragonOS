@@ -17,7 +17,10 @@ use crate::{
     },
     mm::MemoryManagementArch,
     process::{pid::PidType, ProcessState, RawPid},
-    sched::{cputime::ns_to_clock_t, prio::PrioUtil},
+    sched::{
+        cputime::ns_to_clock_t,
+        prio::{self, PrioUtil},
+    },
 };
 use alloc::{
     format,
@@ -75,6 +78,7 @@ struct ProcStatSnapshot {
     num_threads: i64,
     vsize_bytes: u64,
     rss_pages: u64,
+    exit_signal: i32,
     processor: i32,
     utime: u64,
     stime: u64,
@@ -106,7 +110,7 @@ fn generate_linux_proc_stat_line(snapshot: ProcStatSnapshot) -> String {
     format!(
         "{pid} ({comm}) {state_ch} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} \
 {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} \
-{num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 {processor} 0 0 0 0 0\n",
+{num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} {processor} 0 0 0 0 0\n",
         pid = snapshot.pid.data(),
         ppid = snapshot.ppid.data(),
         tty_nr = snapshot.tty_nr,
@@ -117,6 +121,7 @@ fn generate_linux_proc_stat_line(snapshot: ProcStatSnapshot) -> String {
         num_threads = snapshot.num_threads,
         vsize_bytes = snapshot.vsize_bytes,
         rss_pages = snapshot.rss_pages,
+        exit_signal = snapshot.exit_signal,
         processor = snapshot.processor,
     )
 }
@@ -145,7 +150,7 @@ impl FileOps for StatFileOps {
         let cpu_time = pcb.cputime();
         let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
         let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
-        let priority = pcb.sched_info().prio() as i64;
+        let priority = (pcb.sched_info().prio() - prio::MAX_RT_PRIO) as i64;
         let nice = PrioUtil::prio_to_nice(pcb.sched_info().static_prio()) as i64;
         let num_threads = pcb
             .task_pid_ptr(PidType::TGID)
@@ -165,6 +170,16 @@ impl FileOps for StatFileOps {
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(0);
 
+        let exit_signal = {
+            use crate::arch::ipc::signal::Signal;
+            let sig = pcb.exit_signal();
+            if sig == Signal::INVALID {
+                -1
+            } else {
+                sig as i32
+            }
+        };
+
         let ppid = pcb
             .parent_pcb()
             .and_then(|p| p.task_pid_ptr(PidType::TGID))
@@ -182,6 +197,7 @@ impl FileOps for StatFileOps {
             num_threads,
             vsize_bytes,
             rss_pages,
+            exit_signal,
             processor,
             utime,
             stime,

@@ -68,15 +68,21 @@ pub struct RwLockWriteGuard<'a, T: 'a> {
 }
 
 /// `*_bh` 风格的读锁守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
+///
+/// 字段声明顺序保证 drop 时先解锁（guard）再恢复 BH（bh），
+/// 与 Linux `read_unlock_bh()` 语义一致。
 pub struct RwLockReadBhGuard<'a, T: 'a> {
-    bh: LocalBhDisableGuard,
     guard: RwLockReadGuard<'a, T>,
+    bh: LocalBhDisableGuard,
 }
 
 /// `*_bh` 风格的写锁守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
+///
+/// 字段声明顺序保证 drop 时先解锁（guard）再恢复 BH（bh），
+/// 与 Linux `write_unlock_bh()` 语义一致。
 pub struct RwLockWriteBhGuard<'a, T: 'a> {
-    bh: LocalBhDisableGuard,
     guard: RwLockWriteGuard<'a, T>,
+    bh: LocalBhDisableGuard,
 }
 
 unsafe impl<T: Send> Send for RwLock<T> {}

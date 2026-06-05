@@ -15,7 +15,11 @@ impl ProcessManager {
         loop {
             let pcb = ProcessManager::current_pcb();
             if pcb.flags().contains(ProcessFlags::NEED_SCHEDULE) {
-                __schedule(SchedMode::SM_NONE);
+                ProcessManager::preempt_disable();
+                let switched = __schedule(SchedMode::SM_NONE);
+                if !switched {
+                    ProcessManager::preempt_enable();
+                }
             }
             if CurrentIrqArch::is_irq_enabled() {
                 crate::rcu::enter_idle();

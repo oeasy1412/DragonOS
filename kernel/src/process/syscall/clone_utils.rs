@@ -7,7 +7,7 @@ use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
-use crate::sched::completion::Completion;
+use crate::sched::{completion::Completion, wake_up_new_task};
 use crate::syscall::user_access::{write_one_to_user_protected, UserBufferReader};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
@@ -91,13 +91,7 @@ pub fn do_clone(
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
     }
 
-    ProcessManager::wake_up_new_task(&pcb).unwrap_or_else(|e| {
-        panic!(
-            "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
-            pcb.raw_pid(),
-            e
-        )
-    });
+    wake_up_new_task(&pcb);
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
         // 等待子进程结束或者exec;

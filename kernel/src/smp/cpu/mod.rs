@@ -1,9 +1,4 @@
-use core::sync::atomic::AtomicU32;
-
-use alloc::{sync::Arc, vec::Vec};
-use log::{debug, error, info};
-use system_error::SystemError;
-
+use super::{core::smp_get_processor_id, SMPArch};
 use crate::{
     arch::CurrentSMPArch,
     libs::cpumask::CpuMask,
@@ -11,8 +6,10 @@ use crate::{
     process::{ProcessControlBlock, ProcessManager},
     sched::completion::Completion,
 };
-
-use super::{core::smp_get_processor_id, SMPArch};
+use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU32, Ordering};
+use log::{debug, error, info};
+use system_error::SystemError;
 
 int_like!(ProcessorId, AtomicProcessorId, u32, AtomicU32);
 
@@ -42,6 +39,23 @@ pub enum CpuHpState {
 
     /// 该CPU是在线的
     Online,
+}
+
+impl CpuHpState {
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            CpuHpState::ThresholdBringUp => Some(CpuHpState::Offline),
+            CpuHpState::Offline => Some(CpuHpState::Online),
+            CpuHpState::Online => None,
+        }
+    }
+    pub const fn prev(self) -> Option<Self> {
+        match self {
+            CpuHpState::ThresholdBringUp => None,
+            CpuHpState::Offline => Some(CpuHpState::ThresholdBringUp),
+            CpuHpState::Online => Some(CpuHpState::Offline),
+        }
+    }
 }
 
 /// Per-Cpu Cpu的热插拔状态
@@ -130,11 +144,9 @@ impl SmpCpuManager {
         if let Some(prev) = p.possible_cpus.set(cpu, value) {
             if prev != value {
                 if value {
-                    p.possible_cnt
-                        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                    p.possible_cnt.fetch_add(1, Ordering::SeqCst);
                 } else {
-                    p.possible_cnt
-                        .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                    p.possible_cnt.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         }
@@ -146,11 +158,11 @@ impl SmpCpuManager {
     }
 
     pub fn possible_cpus_count(&self) -> u32 {
-        self.possible_cnt.load(core::sync::atomic::Ordering::SeqCst)
+        self.possible_cnt.load(Ordering::SeqCst)
     }
 
     pub fn present_cpus_count(&self) -> u32 {
-        self.present_cnt.load(core::sync::atomic::Ordering::SeqCst)
+        self.present_cnt.load(Ordering::SeqCst)
     }
 
     pub unsafe fn set_present_cpu(&self, cpu: ProcessorId, value: bool) {
@@ -160,11 +172,9 @@ impl SmpCpuManager {
         if let Some(prev) = p.present_cpus.set(cpu, value) {
             if prev != value {
                 if value {
-                    p.present_cnt
-                        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                    p.present_cnt.fetch_add(1, Ordering::SeqCst);
                 } else {
-                    p.present_cnt
-                        .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                    p.present_cnt.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         }
@@ -288,7 +298,7 @@ impl SmpCpuManager {
         ProcessManager::wakeup(cpu_state.thread.as_ref().unwrap())?;
 
         CurrentSMPArch::start_cpu(cpu_id, cpu_state)?;
-        assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
+
         self.wait_for_ap_thread(cpu_state, cpu_state.bringup);
 
         return Ok(());
@@ -302,6 +312,19 @@ impl SmpCpuManager {
                 .expect("failed to wait ap thread");
         } else {
             todo!("wait_for_ap_thread")
+        }
+    }
+
+    pub fn cpuhp_step_state(&self, cpu_id: ProcessorId) {
+        let cpu_state = self.cpuhp_state_mut(cpu_id);
+        if cpu_state.bringup {
+            if let Some(next) = cpu_state.state.next() {
+                cpu_state.state = next;
+            }
+        } else {
+            if let Some(prev) = cpu_state.state.prev() {
+                cpu_state.state = prev;
+            }
         }
     }
 
@@ -319,8 +342,16 @@ impl SmpCpuManager {
 
     fn cpuhp_reset_state(&self, st: &mut CpuHpCpuState, prev_state: CpuHpState) {
         let bringup = !st.bringup;
+        if bringup {
+            if let Some(s) = st.state.prev() {
+                st.state = s;
+            }
+        } else {
+            if let Some(s) = st.state.next() {
+                st.state = s;
+            }
+        }
         st.target_state = prev_state;
-
         st.bringup = bringup;
     }
 }

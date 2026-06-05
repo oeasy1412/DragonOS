@@ -97,17 +97,6 @@ impl FifoScheduler {
     fn rt_prio(pcb: &ProcessControlBlock) -> i32 {
         pcb.sched_info().prio()
     }
-
-    /// 对标 Linux set_next_task_rt：将 FIFO 任务设为当前运行任务。
-    ///
-    /// FIFO 不像 CFS 那样维护 per-class current entity，
-    /// 但需要在 running 任务修改策略/优先级后被调用以保持与 Linux 一致的流程。
-    pub fn set_next_task(
-        _rq: &mut super::CpuRunQueue,
-        _pcb: alloc::sync::Arc<crate::process::ProcessControlBlock>,
-    ) {
-        // FIFO 不维护 per-class 调度实体状态，无需额外操作
-    }
 }
 
 impl Scheduler for FifoScheduler {
@@ -123,11 +112,10 @@ impl Scheduler for FifoScheduler {
     }
 
     fn yield_task(rq: &mut CpuRunQueue) {
-        let curr = rq.current();
-        if curr.sched_info().policy() != SchedPolicy::FIFO {
+        if rq.current_ref().sched_info().policy() != SchedPolicy::FIFO {
             return;
         }
-        rq.fifo.yield_current(&curr);
+        rq.fifo.yield_current(&rq.current());
         rq.resched_current();
     }
 
@@ -136,14 +124,13 @@ impl Scheduler for FifoScheduler {
         pcb: &Arc<ProcessControlBlock>,
         _flags: WakeupFlags,
     ) {
-        let curr = rq.current();
-        if curr.sched_info().policy() != SchedPolicy::FIFO {
+        if rq.current_ref().sched_info().policy() != SchedPolicy::FIFO {
             rq.resched_current();
             return;
         }
 
         let new_prio = Self::rt_prio(pcb);
-        let curr_prio = Self::rt_prio(&curr);
+        let curr_prio = Self::rt_prio(rq.current_ref());
         if PrioUtil::rt_prio(new_prio) && PrioUtil::rt_prio(curr_prio) && new_prio < curr_prio {
             rq.resched_current();
         }

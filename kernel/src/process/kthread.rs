@@ -203,7 +203,7 @@ impl KernelThreadCreateInfo {
                     return self.result_pcb.lock().take();
                 }
                 KernelThreadCreateStatus::NotCreated => {
-                    spin_loop();
+                    schedule(SchedMode::SM_NONE);
                 }
                 KernelThreadCreateStatus::ErrorOccured => {
                     // 创建失败，减少不安全的Arc引用计数

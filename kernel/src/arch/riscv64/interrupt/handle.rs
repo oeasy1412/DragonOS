@@ -9,9 +9,8 @@ use system_error::SystemError;
 use super::TrapFrame;
 use crate::exception::ebreak::EBreak;
 use crate::{
-    arch::syscall::syscall_handler,
-    driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
-    process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
+    arch::driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
+    process::{preempt::preempt_count_val, utils::current_pcb_flags, ProcessFlags, ProcessManager},
     sched::{SchedMode, SchedPolicy, __schedule},
 };
 
@@ -47,8 +46,13 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
             && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
         crate::rcu::irq_exit(resume_idle_eqs);
 
-        if should_schedule {
-            __schedule(SchedMode::SM_PREEMPT);
+        if should_schedule && preempt_count_val() == 0 {
+            // 若 __schedule bail out（持锁不可抢占），必须 preempt_enable 以平衡。
+            ProcessManager::preempt_disable();
+            let switched = __schedule(SchedMode::SM_PREEMPT);
+            if !switched {
+                ProcessManager::preempt_enable();
+            }
         }
     } else if trap_frame.cause.is_exception() {
         riscv64_do_exception(trap_frame);

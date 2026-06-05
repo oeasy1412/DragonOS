@@ -109,8 +109,9 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     do_initcalls().unwrap_or_else(|err| {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
-    smp_init();
+    // 初始化：workqueue_init 先于 smp_init
     crate::exception::workqueue::workqueue_init();
+    smp_init();
     return Ok(());
 }
 

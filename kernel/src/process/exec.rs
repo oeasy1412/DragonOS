@@ -1,4 +1,4 @@
-use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
+use core::{fmt::Debug, ptr::null};
 
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
@@ -342,7 +342,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             //     "de_thread: single-thread fast path pid={:?}",
             //     current.raw_pid()
             // );
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            current.set_exit_signal(Signal::SIGCHLD);
             return Ok(());
         }
 
@@ -433,8 +433,8 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
             ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
 
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
-            leader.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+            current.set_exit_signal(Signal::SIGCHLD);
+            leader.set_exit_signal(Signal::INVALID);
 
             // 将当前线程提升为线程组 leader，并清空 group_tasks（已无其他线程）
             {
@@ -489,7 +489,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
                 unsafe { ProcessManager::release(leader.raw_pid()) };
             }
         } else {
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            current.set_exit_signal(Signal::SIGCHLD);
         }
 
         Ok(())

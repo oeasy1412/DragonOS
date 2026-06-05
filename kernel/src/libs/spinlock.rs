@@ -147,6 +147,33 @@ impl<T> SpinLock<T> {
     ///
     /// 由于这样做可能导致preempt count不正确，因此必须小心的手动维护好preempt count。
     /// 如非必要，请不要使用这个函数。
+    /// 获取锁并禁用中断，但**不增加** preempt_count。
+    ///
+    /// 专用于 context_switch 中 `SpinLockGuard::leak()` 场景：guard 被 leak 后
+    /// Drop 不会执行，如果用 `try_lock_irqsave` 则 `preempt_disable` 永远不会被平衡。
+    /// 由于 context_switch 在 IRQ 已禁用 + rq lock 已持有的上下文中执行，
+    /// 抢占不可能发生，因此跳过 preempt_disable 是安全的。
+    ///
+    /// ## Safety
+    ///
+    /// 调用者必须保证：
+    /// - 本 CPU 硬中断已禁用（或等价的无抢占环境）
+    /// - 守卫将通过 `SpinLockGuard::leak()` 泄漏，由 `force_unlock()` 手动释放
+    /// - 不需要对 preempt_count 的维护
+    pub unsafe fn lock_irqsave_no_preempt(&self) -> SpinLockGuard<'_, T> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        loop {
+            if self.inner_try_lock() {
+                return SpinLockGuard {
+                    lock: self,
+                    data: unsafe { &mut *self.data.get() },
+                    irq_flag: Some(irq_guard),
+                };
+            }
+            spin_loop();
+        }
+    }
+
     pub unsafe fn force_unlock(&self) {
         self.lock.store(false, Ordering::Release);
     }
