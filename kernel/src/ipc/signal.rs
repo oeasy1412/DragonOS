@@ -874,48 +874,39 @@ fn __set_current_blocked(new_set: &SigSet) {
 }
 
 fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
-    // Linux 语义：当线程的 blocked 集发生变化（尤其是“新增屏蔽”）时，
-    // 需要尝试把 shared_pending 中受影响的信号“重定向”给同一线程组内
+    // Linux 语义：当线程的 blocked 集发生变化（尤其是"新增屏蔽"）时，
+    // 需要尝试把 shared_pending 中受影响的信号"重定向"给同一线程组内
     // 其他未屏蔽该信号的线程去处理。
-    let retarget = pcb.sighand().shared_pending_signal().intersection(which);
+    let mut retarget = pcb.sighand().shared_pending_signal().intersection(which);
     if retarget.is_empty() {
         return;
     }
 
-    // 对于线程组中的每一个线程都要执行的函数
-    let thread_handling_function = |pcb: Arc<ProcessControlBlock>, retarget: &SigSet| {
+    // 遍历同一线程组的所有线程
+    let threads = pcb.thread_group_tasks();
+    for thread in threads {
         if retarget.is_empty() {
-            return;
+            break;
         }
 
-        if pcb.flags().contains(ProcessFlags::EXITING) {
-            return;
+        if thread.flags().contains(ProcessFlags::EXITING) {
+            continue;
         }
 
         // 若该线程把 retarget 中的信号全部屏蔽，则它无法处理这些 shared_pending 信号
-        let blocked = *pcb.sig_info_irqsave().sig_blocked();
+        let blocked = *thread.sig_info_irqsave().sig_blocked();
         if retarget.difference(blocked).is_empty() {
-            return;
+            continue;
         }
 
-        if !pcb.has_pending_signal() {
-            signal_wake_up(pcb.clone(), false);
+        if !thread.has_pending_signal() {
+            signal_wake_up(thread.clone(), false);
         }
-        // 之前的对retarget的判断移动到最前面，因为对于当前线程的线程的处理已经结束，对于后面的线程在一开始判断retarget为空即可结束处理
 
-        // debug!("handle done");
-    };
-
-    // 暴力遍历每一个线程，找到相同的tgid
-    let tgid = pcb.task_tgid_vnr();
-    for &pid in pcb.children_read_irqsave().iter() {
-        if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
-            if child.task_tgid_vnr() == tgid {
-                thread_handling_function(child, &retarget);
-            }
-        }
+        // 交集操作 retarget &= blocked：保留被该线程屏蔽（不能处理）的信号，
+        // 等价于从 retarget 中移除该线程能处理的信号。
+        retarget = retarget.intersection(blocked);
     }
-    // debug!("retarget_shared_pending done!");
 }
 
 /// 设置当前进程的屏蔽信号 (sig_block)

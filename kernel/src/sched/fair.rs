@@ -1511,6 +1511,19 @@ impl Default for CfsRunQueue {
 pub struct CompletelyFairScheduler;
 
 impl CompletelyFairScheduler {
+    /// 将 se 的负载从旧 cfs_rq 的 removed 队列中延迟扣除
+    pub fn remove_entity_load_avg(se: &Arc<FairSchedEntity>) {
+        let cfs_rq = se.cfs_rq();
+        let now = cfs_rq.cfs_rq_clock_pelt();
+        unsafe { se.force_mut() }.update_load_avg_blocked(now);
+
+        let mut removed = cfs_rq.removed.lock_irqsave();
+        removed.util_avg += se.avg.util_avg.load(Ordering::Relaxed);
+        removed.load_avg += se.avg.load_avg.load(Ordering::Relaxed);
+        removed.runnable_avg += se.avg.runnable_avg.load(Ordering::Relaxed);
+        removed.nr += 1;
+    }
+
     pub fn set_next_task(_rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
         let mut se = next.sched_info().sched_entity();
         FairSchedEntity::for_each_in_group(&mut se, |se| {

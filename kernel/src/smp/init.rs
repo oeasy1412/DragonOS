@@ -13,7 +13,6 @@ pub fn smp_ap_start_stage2() -> ! {
 
     let cpu_id = smp_get_processor_id();
     smp_cpu_manager().cpuhp_step_state(cpu_id);
-    smp_cpu_manager().complete_ap_thread(true);
 
     do_ap_start_stage2();
 
@@ -23,6 +22,8 @@ pub fn smp_ap_start_stage2() -> ! {
 
     // idle task 已创建，归零 per-CPU preempt_count 以清除 boot 过程中累积的不平衡。
     set_preempt_count_val(0);
+
+    smp_cpu_manager().complete_ap_thread(true);
 
     ProcessManager::arch_idle_func();
 }

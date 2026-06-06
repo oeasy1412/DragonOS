@@ -1068,6 +1068,8 @@ impl ProcessControlBlock {
         self.__unhash_process(group_dead);
 
         drop(tty);
+
+        self.sighand().detach_task_ref();
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#123

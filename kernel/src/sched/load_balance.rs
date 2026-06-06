@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::{collections::LinkedList, sync::Arc};
 
 use super::{
-    cpu_rq, is_idle_cpu,
+    cpu_is_online, cpu_rq, is_idle_cpu,
     sched_domain::{GroupType, MigrationType, SchedDomain, SchedGroup, SdLbStats, SgLbStats},
     CpuRunQueue, EnqueueFlag, SchedPolicy, WakeupFlags, SCHED_CAPACITY_SCALE,
 };
@@ -203,6 +203,9 @@ impl LoadBalancer {
             if !smp_cpu_manager().present_cpus().get(cpu).unwrap_or(false) {
                 continue;
             }
+            if !cpu_is_online(cpu) {
+                continue;
+            }
             if is_idle_cpu(cpu) {
                 return cpu;
             }
@@ -256,6 +259,7 @@ impl LoadBalancer {
                 && cpu != prev_cpu
                 && is_idle_cpu(cpu)
                 && smp_cpu_manager().present_cpus().get(cpu).unwrap_or(false)
+                && cpu_is_online(cpu)
             {
                 return cpu;
             }
@@ -299,7 +303,7 @@ pub struct LbEnv {
     pub src_cpu: ProcessorId,
     pub idle: super::rebalance::CpuIdleType,
     pub migration_type: MigrationType,
-    pub imbalance: u64,
+    pub imbalance: i64,
     pub flags: LbfFlags,
     pub tasks: LinkedList<Arc<ProcessControlBlock>>,
     pub new_dst_cpu: ProcessorId,
@@ -443,7 +447,7 @@ fn calculate_imbalance_single_group(env: &mut LbEnv, sds: &SdLbStats) {
         // 组过载：使用 MigrateLoad，计算 dst_cpu 低于平均值的差额
         env.migration_type = MigrationType::Load;
         if dst_load < per_cpu_avg {
-            env.imbalance = per_cpu_avg.saturating_sub(dst_load);
+            env.imbalance = per_cpu_avg.saturating_sub(dst_load) as i64;
         } else {
             // dst_cpu 已经高于平均，无需迁移
             env.imbalance = 0;
@@ -646,7 +650,8 @@ const SCHED_NR_MIGRATE_BREAK: u32 = 32;
 
 #[inline]
 fn shr_bound(val: u64, shift: u32) -> u64 {
-    (val >> shift).max(1)
+    let shift = shift.min(u64::BITS - 1);
+    val >> shift
 }
 
 /// 从 src_rq 分离任务，直到满足 env.imbalance。调用时必须持有 src_rq 锁。
@@ -660,7 +665,7 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
         return 0;
     }
 
-    if env.imbalance == 0 {
+    if env.imbalance <= 0 {
         return 0;
     }
 
@@ -711,22 +716,27 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
             continue;
         }
 
-        if !can_migrate_task(&pcb, env, &pcb.sched_info().cpus_allowed()) {
+        // SAFETY: 当前持有 src_rq 的 rq_lock。运行时 cpus_allowed 写路径
+        // (sched_setaffinity) 同时需要 pi_lock + rq_lock，因此 rq_lock 提供了互斥保护。
+        let cpus_allowed = unsafe { pcb.sched_info().cpus_allowed_rq_locked() };
+        if !can_migrate_task(&pcb, env, cpus_allowed) {
             retry.push_front(se);
             continue;
         }
 
         match env.migration_type {
             MigrationType::Load => {
-                let load = se.avg.load_avg.load(Ordering::Relaxed).max(1) as u64;
-                if shr_bound(load, nr_balance_failed) > env.imbalance {
+                let load = se.avg.load_avg.load(Ordering::Relaxed).max(1) as i64;
+                let bounded = shr_bound(load as u64, nr_balance_failed) as i64;
+                if bounded > env.imbalance {
                     retry.push_front(se);
                     continue;
                 }
                 env.imbalance -= load;
             }
             MigrationType::Util => {
-                let util = se.avg.util_avg.load(Ordering::Relaxed).max(1) as u64;
+                let util = se.avg.util_avg.load(Ordering::Relaxed).max(1) as i64;
+                // 对标 Linux fair.c:8907-8914: migrate_util 直接比较，不使用 shr_bound
                 if util > env.imbalance {
                     retry.push_front(se);
                     continue;
@@ -734,7 +744,7 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
                 env.imbalance -= util;
             }
             MigrationType::Task => {
-                if env.imbalance == 0 {
+                if env.imbalance <= 0 {
                     retry.push_front(se);
                     continue;
                 }
@@ -756,7 +766,7 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
         env.tasks.push_back(pcb);
         detached += 1;
 
-        if env.imbalance == 0 {
+        if env.imbalance <= 0 {
             break;
         }
     }
@@ -1028,16 +1038,22 @@ pub fn load_balance(
         // Active balance: 推送 busiest 的当前任务到 dst_cpu
         if need_active_balance(&env) {
             let src_rq_arc = cpu_rq(env.src_cpu.data() as usize);
-            let (src_rq, src_guard) = src_rq_arc.self_lock();
-
-            let curr = src_rq.current();
+            // 在 rq_lock 外读取 cpus_allowed。
+            // cpus_allowed() 内部获取 pi_lock (mod.rs:3306)，若在 rq_lock 内调用则产生
+            // rq_lock → pi_lock 的 ABBA 死锁（与 wakeup 路径的 pi_lock → rq_lock 反序）。
+            //
+            // Linux 对策: cpus_ptr 是可无锁读取的指针（fair.c:8714），在 rq_lock 内直接解引用。
+            // DragonOS 的 cpus_allowed 在 pi_lock 保护的 SpinLock 内，无法无锁读取。
+            //
+            // 此处接受 TOCTOU 竞态：cpus_allowed 值可能过时，最坏结果是 active balance
+            // 错过了本应推送的任务（下次负载均衡会重试）。
+            let curr = src_rq_arc.current();
             if curr.sched_info().policy() != SchedPolicy::IDLE {
                 let cpus_allowed = curr.sched_info().cpus_allowed();
                 if cpus_allowed.get(env.dst_cpu).unwrap_or(false) {
                     let _ = super::request_task_migration(&curr, env.dst_cpu);
                 }
             }
-            drop(src_guard);
         }
     }
 

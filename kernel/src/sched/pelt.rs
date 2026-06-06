@@ -244,6 +244,16 @@ impl CfsRunQueue {
 }
 
 impl FairSchedEntity {
+    /// Blocked 语义的 PELT 更新（固定传 0, 0, 0）
+    pub fn update_load_avg_blocked(&mut self, now: u64) -> bool {
+        if self.avg.update_load_sum(now, 0, 0, 0) {
+            self.avg
+                .update_load_avg(LoadWeight::scale_load_down(self.load.weight));
+            return true;
+        }
+        false
+    }
+
     pub fn update_load_avg(&mut self, cfs_rq: &mut CfsRunQueue, now: u64) -> bool {
         if self.avg.update_load_sum(
             now,

@@ -66,19 +66,27 @@ impl ProcessManager {
         }
     }
 
-    /// 减少当前 CPU 的抢占计数。
+    /// 减少当前 CPU 的抢占计数，不检查 need_resched。
     #[inline(always)]
-    pub fn preempt_enable() {
+    pub fn preempt_enable_no_resched() {
         if likely(unsafe { __PROCESS_MANAGEMENT_INIT_DONE }) {
             let prev = current_preempt_count().fetch_sub(1, Ordering::Relaxed);
             if unlikely(prev == 0) {
                 log::error!(
-                    "preempt_enable underflow on cpu {} (count was 0)",
+                    "preempt_enable_no_resched underflow on cpu {} (count was 0)",
                     smp_get_processor_id().data()
                 );
-                // 恢复为 0，避免 usize::MAX 导致抢占被永久禁用。
                 current_preempt_count().store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// 减少当前 CPU 的抢占计数。
+    ///
+    /// TODO: 当 count 归零时应检查 need_resched() 并可能调用 preempt_schedule()。
+    /// 当前实现等价于 preempt_enable_no_resched()
+    #[inline(always)]
+    pub fn preempt_enable() {
+        Self::preempt_enable_no_resched();
     }
 }

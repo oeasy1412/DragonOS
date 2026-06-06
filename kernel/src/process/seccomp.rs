@@ -911,7 +911,7 @@ fn seccomp_can_sync_threads(
     current: &Arc<ProcessControlBlock>,
     current_filter: &Option<Arc<SeccompFilter>>,
 ) -> Result<(), SystemError> {
-    for thread in thread_group_tasks(current) {
+    for thread in current.thread_group_tasks() {
         if Arc::ptr_eq(&thread, current) || thread.is_exited() || thread.is_dead() {
             continue;
         }
@@ -934,7 +934,7 @@ fn seccomp_can_sync_threads(
 }
 
 fn seccomp_sync_threads(current: &Arc<ProcessControlBlock>, filter: Arc<SeccompFilter>) {
-    for thread in thread_group_tasks(current) {
+    for thread in current.thread_group_tasks() {
         if Arc::ptr_eq(&thread, current) || thread.is_exited() || thread.is_dead() {
             continue;
         }
@@ -947,24 +947,6 @@ fn seccomp_sync_threads(current: &Arc<ProcessControlBlock>, filter: Arc<SeccompF
             thread.set_no_new_privs(true);
         }
     }
-}
-
-fn thread_group_tasks(current: &Arc<ProcessControlBlock>) -> Vec<Arc<ProcessControlBlock>> {
-    let leader = current
-        .threads_read_irqsave()
-        .group_leader()
-        .unwrap_or_else(|| current.clone());
-    let mut tasks = Vec::new();
-    tasks.push(leader.clone());
-
-    let weak_tasks = leader.threads_read_irqsave().group_tasks_clone();
-    for weak in weak_tasks {
-        if let Some(task) = weak.upgrade() {
-            tasks.push(task);
-        }
-    }
-
-    tasks
 }
 
 fn is_filter_ancestor(

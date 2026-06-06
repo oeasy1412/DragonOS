@@ -18,7 +18,7 @@ impl ProcessManager {
                 ProcessManager::preempt_disable();
                 let switched = __schedule(SchedMode::SM_NONE);
                 if !switched {
-                    ProcessManager::preempt_enable();
+                    ProcessManager::preempt_enable_no_resched();
                 }
             }
             if CurrentIrqArch::is_irq_enabled() {

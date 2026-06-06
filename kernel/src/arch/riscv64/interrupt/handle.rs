@@ -51,7 +51,7 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
             ProcessManager::preempt_disable();
             let switched = __schedule(SchedMode::SM_PREEMPT);
             if !switched {
-                ProcessManager::preempt_enable();
+                ProcessManager::preempt_enable_no_resched();
             }
         }
     } else if trap_frame.cause.is_exception() {

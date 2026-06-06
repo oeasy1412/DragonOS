@@ -63,6 +63,21 @@ impl<'a, T: 'a> SpinLockGuard<'a, T> {
 unsafe impl<T> Sync for SpinLock<T> where T: Send {}
 
 impl<T> SpinLock<T> {
+    /// 在外部同步保证下，不获取锁直接读取内部数据的共享引用。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证通过其他同步机制（如另一个锁）与所有写者互斥。
+    /// 调用期间绝对不能有其他代码通过 `lock()`/`try_lock()` 等方式获取写访问。
+    ///
+    /// 对标 Linux: 这个模式等价于 Linux 中在 `rq_lock` 保护下读取
+    /// `pi_lock` 保护的字段（如 `p->cpus_ptr`）。Linux 依赖 `rq_lock` 与写者
+    /// 互斥（core.c:486-493），此处依赖同样的原理。
+    #[inline]
+    pub(crate) unsafe fn get_assume_locked(&self) -> &T {
+        &*self.data.get()
+    }
+
     pub const fn new(value: T) -> Self {
         return Self {
             lock: AtomicBool::new(false),
@@ -82,9 +97,15 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<'_, T> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
         loop {
-            if let Ok(guard) = self.try_lock_irqsave() {
-                return guard;
+            if self.inner_try_lock() {
+                return SpinLockGuard {
+                    lock: self,
+                    data: unsafe { &mut *self.data.get() },
+                    irq_flag: Some(irq_guard),
+                };
             }
             spin_loop();
         }

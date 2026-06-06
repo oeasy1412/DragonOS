@@ -707,7 +707,6 @@ impl Rseq {
 
     /// 在 CPU 迁移时调用
     #[inline]
-    #[allow(dead_code)]
     pub fn on_migrate(pcb: &ProcessControlBlock) {
         if pcb.rseq_state().is_registered() {
             pcb.rseq_state().set_event(RseqEventMask::MIGRATE);

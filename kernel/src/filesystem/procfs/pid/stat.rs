@@ -20,6 +20,7 @@ use crate::{
     sched::{
         cputime::ns_to_clock_t,
         prio::{self, PrioUtil},
+        SchedPolicy,
     },
 };
 use alloc::{
@@ -82,6 +83,8 @@ struct ProcStatSnapshot {
     processor: i32,
     utime: u64,
     stime: u64,
+    rt_priority: i32,
+    policy: i32,
 }
 
 /// 生成 Linux 风格的 /proc/[pid]/stat 行
@@ -110,7 +113,7 @@ fn generate_linux_proc_stat_line(snapshot: ProcStatSnapshot) -> String {
     format!(
         "{pid} ({comm}) {state_ch} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} \
 {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} \
-{num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} {processor} 0 0 0 0 0\n",
+{num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} {processor} {rt_priority} {policy} 0 0 0 0 0 0 0 0 0 0 0\n",
         pid = snapshot.pid.data(),
         ppid = snapshot.ppid.data(),
         tty_nr = snapshot.tty_nr,
@@ -123,6 +126,8 @@ fn generate_linux_proc_stat_line(snapshot: ProcStatSnapshot) -> String {
         rss_pages = snapshot.rss_pages,
         exit_signal = snapshot.exit_signal,
         processor = snapshot.processor,
+        rt_priority = snapshot.rt_priority,
+        policy = snapshot.policy,
     )
 }
 
@@ -186,6 +191,17 @@ impl FileOps for StatFileOps {
             .map(|pid| pid.pid_nr_ns(self.target.view_pid_ns()))
             .unwrap_or(RawPid::new(0));
 
+        let rt_priority: i32 = match pcb.sched_info().policy() {
+            SchedPolicy::FIFO | SchedPolicy::RT => pcb.sched_info().rt_priority(),
+            _ => 0,
+        };
+        let policy: i32 = match pcb.sched_info().policy() {
+            SchedPolicy::CFS => 0,
+            SchedPolicy::FIFO => 1,
+            SchedPolicy::RT => 2,
+            SchedPolicy::IDLE => 5,
+        };
+
         let content = generate_linux_proc_stat_line(ProcStatSnapshot {
             pid: self.target.vpid(),
             comm,
@@ -201,6 +217,8 @@ impl FileOps for StatFileOps {
             processor,
             utime,
             stime,
+            rt_priority,
+            policy,
         });
         proc_read(offset, len, buf, content.as_bytes())
     }

@@ -50,7 +50,7 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
         ProcessManager::preempt_disable();
         let switched = __schedule(SchedMode::SM_PREEMPT);
         if !switched {
-            ProcessManager::preempt_enable();
+            ProcessManager::preempt_enable_no_resched();
         }
     }
 }

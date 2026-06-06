@@ -306,7 +306,6 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.raw_pid(), pcb.clone());
-        loadavg::inc_nr_threads();
     }
 
     pub(crate) fn exchange_tid_and_raw_pids(
@@ -1045,7 +1044,7 @@ impl ProcessManager {
         ProcessManager::preempt_disable();
         let switched = __schedule(SchedMode::SM_NONE);
         if !switched {
-            ProcessManager::preempt_enable();
+            ProcessManager::preempt_enable_no_resched();
         }
         panic!("raw_pid {raw_pid:?} exited but __schedule returned without switching!");
     }
@@ -1177,7 +1176,6 @@ impl ProcessManager {
             }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
-            loadavg::dec_nr_threads();
         }
     }
 
@@ -1280,9 +1278,9 @@ impl ProcessManager {
         let cpu = smp_get_processor_id();
         let rq = cpu_rq(cpu.data() as usize);
         unsafe { rq.force_unlock() };
-        ProcessManager::preempt_enable(); // 平衡 rq_lock
+        ProcessManager::preempt_enable_no_resched(); // 平衡 rq_lock
         crate::arch::asm::irqflags::local_irq_enable();
-        ProcessManager::preempt_enable(); // 平衡 schedule
+        ProcessManager::preempt_enable_no_resched(); // 平衡 schedule
 
         // 释放 exit() 中存入 PROCESS_SWITCH_RESULT.prev_mm 的 AddressSpace 引用。
         // 在 IRQ enable 之后做 mmdrop，因为 mmdrop 可能睡眠（synchronize_rcu）
@@ -1416,7 +1414,7 @@ mod state_bits {
     pub const TASK_INTERRUPTIBLE: u32 = 0x0001;
     pub const TASK_UNINTERRUPTIBLE: u32 = 0x0002;
     pub const TASK_STOPPED: u32 = 0x0004;
-    pub const TASK_DEAD_MARKER: u32 = 0x0100;
+    pub const TASK_DEAD_MARKER: u32 = 0x0080;
     pub const EXIT_CODE_SHIFT: u32 = 12;
 }
 
@@ -2065,12 +2063,12 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn exit_signal(&self) -> Signal {
-        self.exit_signal.load(Ordering::Relaxed)
+        self.exit_signal.load(Ordering::Acquire)
     }
 
     #[inline(always)]
     pub fn set_exit_signal(&self, sig: Signal) {
-        self.exit_signal.store(sig, Ordering::Relaxed);
+        self.exit_signal.store(sig, Ordering::Release);
     }
 
     #[inline(always)]
@@ -2579,6 +2577,26 @@ impl ProcessControlBlock {
         self.thread.write_irqsave()
     }
 
+    /// 获取当前线程组的所有线程（包括自身）
+    pub fn thread_group_tasks(&self) -> Vec<Arc<ProcessControlBlock>> {
+        let leader = self
+            .threads_read_irqsave()
+            .group_leader()
+            .or_else(|| self.self_ref.upgrade());
+        let Some(leader) = leader else {
+            return Vec::new();
+        };
+        let mut tasks = Vec::new();
+        tasks.push(leader.clone());
+        let weak_tasks = leader.threads_read_irqsave().group_tasks_clone();
+        for weak in weak_tasks {
+            if let Some(task) = weak.upgrade() {
+                tasks.push(task);
+            }
+        }
+        tasks
+    }
+
     pub fn restart_block(&self) -> SpinLockGuard<'_, Option<RestartBlock>> {
         self.restart_block.lock()
     }
@@ -2957,7 +2975,10 @@ impl OnRqCell {
             0 => OnRq::None,
             1 => OnRq::Queued,
             2 => OnRq::Migrating,
-            _ => OnRq::None,
+            v => {
+                log::error!("OnRqCell corrupted: {}", v);
+                OnRq::None
+            }
         }
     }
     #[inline(always)]
@@ -3290,6 +3311,17 @@ impl ProcessSchedulerInfo {
         self.pi_lock.lock_irqsave().cpus_allowed.clone()
     }
 
+    /// 在 rq_lock 保护下无锁读取 cpus_allowed。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须持有 task 所在 CPU 的 rq_lock。运行时 cpus_allowed 写路径
+    /// (`sched_setaffinity`) 同时需要 pi_lock + rq_lock，因此 rq_lock 提供了互斥保护。
+    /// 非运行时写路径（fork/init/kthread 创建）在 task 被调度前执行，不存在并发读取。
+    pub unsafe fn cpus_allowed_rq_locked(&self) -> &CpuMask {
+        self.pi_lock.get_assume_locked().cpus_allowed()
+    }
+
     pub fn nr_cpus_allowed(&self) -> usize {
         self.pi_lock.lock_irqsave().nr_cpus_allowed
     }
@@ -3303,7 +3335,7 @@ impl ProcessSchedulerInfo {
         use crate::time::clocksource::HZ;
         let now = crate::time::timer::clock();
         let ts = self.wakee_flip_decay_ts.load(Ordering::Relaxed);
-        if now >= ts + HZ {
+        if now.wrapping_sub(ts) > HZ {
             let flips = self.wakee_flips.load(Ordering::Relaxed);
             self.wakee_flips.store(flips >> 1, Ordering::Release);
             self.wakee_flip_decay_ts.store(now, Ordering::Release);

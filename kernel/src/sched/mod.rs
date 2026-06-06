@@ -16,23 +16,15 @@ pub mod sched_domain;
 pub mod syscall;
 pub mod topology;
 
-use core::{
-    intrinsics::{likely, unlikely},
-    panic::Location,
-    sync::atomic::{
-        compiler_fence, fence, AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering,
-    },
+use self::{
+    clock::{ClockUpdataFlag, SchedClock},
+    cputime::{irq_time_read, CpuTimeFunc, IrqTime},
+    fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
+    fifo::FifoScheduler,
+    idle::IdleScheduler,
+    prio::PrioUtil,
+    sched_domain::SchedDomain,
 };
-
-use alloc::{
-    boxed::Box,
-    collections::LinkedList,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use log::warn;
-use system_error::SystemError;
-
 use crate::{
     arch::{
         asm::irqflags::{local_irq_disable, local_irq_enable},
@@ -56,22 +48,27 @@ use crate::{
         preempt::PreemptGuard, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState,
         SchedInfo,
     },
-    sched::idle::IdleScheduler,
     smp::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
     },
     time::{clocksource::HZ, timer::clock},
 };
-
-use self::{
-    clock::{ClockUpdataFlag, SchedClock},
-    cputime::{irq_time_read, CpuTimeFunc, IrqTime},
-    fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
-    fifo::FifoScheduler,
-    prio::PrioUtil,
-    sched_domain::SchedDomain,
+use alloc::{
+    boxed::Box,
+    collections::LinkedList,
+    sync::{Arc, Weak},
+    vec::Vec,
 };
+use core::{
+    intrinsics::{likely, unlikely},
+    panic::Location,
+    sync::atomic::{
+        compiler_fence, fence, AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering,
+    },
+};
+use log::warn;
+use system_error::SystemError;
 
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
 pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
@@ -875,10 +872,7 @@ impl CpuRunQueue {
                     prev_cpu,
                     cpu
                 );
-                if pcb
-                    .flags()
-                    .contains(crate::process::ProcessFlags::IN_IOWAIT)
-                {
+                if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
                     cpu_rq(prev_cpu.data() as usize).dec_nr_iowait();
                 }
                 __set_task_cpu(&pcb, cpu);
@@ -887,17 +881,12 @@ impl CpuRunQueue {
             // nr_uninterruptible 在目标 rq（self，已持锁）上递减
             if pcb
                 .flags()
-                .contains(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
+                .contains(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
             {
                 self.dec_nr_uninterruptible();
-                pcb.flags()
-                    .remove(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
+                pcb.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
             }
-            if !migrated
-                && pcb
-                    .flags()
-                    .contains(crate::process::ProcessFlags::IN_IOWAIT)
-            {
+            if !migrated && pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
                 self.dec_nr_iowait();
             }
             // 新 fork 的 CFS 任务 util_avg 初始为 0（init_entity_runnable_average），
@@ -1404,7 +1393,7 @@ pub fn schedule(sched_mod: SchedMode) {
         ProcessManager::preempt_disable();
         let switched = __schedule(sched_mod);
         if !switched {
-            ProcessManager::preempt_enable();
+            ProcessManager::preempt_enable_no_resched();
         }
         if !need_resched() {
             break;
@@ -1491,12 +1480,13 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
             });
         }
 
-        prev.sched_info().on_rq.set(OnRq::None);
         __set_task_cpu(&prev, dest_cpu);
-        prev.sched_info().set_on_cpu(None);
+        prev.sched_info().on_rq.set(OnRq::None);
+        // on_cpu 不在此处清除——由 switch_finish_hook 在 context switch 之后统一清除，
+        // 在此期间 on_cpu==Some(src_cpu) 使得远端 ttwu / drain_wake_queue 正确地 re-queue 而非误判进程为空闲。
 
         // 将迁移目标存入 PROCESS_SWITCH_RESULT，由 switch_finish_hook 在
-        // set_on_cpu(None) 之后 push WakeQueue + send_resched_ipi。
+        // context switch 完成 + set_on_cpu(None) 之后 push WakeQueue + send_resched_ipi。
         unsafe {
             crate::process::PROCESS_SWITCH_RESULT
                 .as_mut()
@@ -1562,6 +1552,11 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
                         DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
                     );
                 }
+                // 将退出进程的 se 负载从 cfs_rq 的 removed 队列中延迟扣除，防止 PELT 残留影响负载均衡决策。
+                if prev.sched_info().policy() == SchedPolicy::CFS {
+                    let se = prev.sched_info().sched_entity();
+                    CompletelyFairScheduler::remove_entity_load_avg(&se);
+                }
             } else {
                 // sched_contributes_to_load 和 nr_uninterruptible++ 必须在任务正式离开运行队列之前完成。
                 let contributes_to_load = matches!(prev_state, ProcessState::Blocked(false));
@@ -1598,7 +1593,6 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
     prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
     fence(Ordering::SeqCst);
     if likely(!Arc::ptr_eq(&prev, &next)) {
-        // core.c:6687: ++*switch_count
         if voluntary_switch {
             prev.inc_nvcsw();
         } else {
@@ -1647,7 +1641,15 @@ pub fn __schedule(sched_mod: SchedMode) -> bool {
         unsafe { ProcessManager::switch_process(prev, next) };
         true
     } else {
-        drop(guard);
+        // 显式 drop prev 和 next，确保所有 Drop chain 在中断关闭时完成。
+        // self_lock_no_irq 的 guard 的 irq_flag = None，forget 不会泄漏中断状态。
+        core::mem::forget(guard);
+        unsafe { rq.force_unlock() };
+        ProcessManager::preempt_enable_no_resched();
+        // 在中断仍关闭的状态下完成所有 Arc Drop，防止 Drop chain 中的中断恢复导致 rq lock 重入。
+        drop(next);
+        drop(prev);
+
         if irq_was_enabled {
             local_irq_enable();
         }
@@ -1820,6 +1822,21 @@ pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
             cpu,
             on_rq,
         );
+
+        // 当 on_rq==Migrating 时跳过 remove，
+        // 因为 detach_entity_load_avg 已在 dequeue_entity(DEQUEUE_MOVE) 中执行。
+        if old_cpu != ProcessorId::INVALID
+            && on_rq != OnRq::Migrating
+            && pcb.sched_info().policy() == SchedPolicy::CFS
+        {
+            let se = pcb.sched_info().sched_entity();
+            CompletelyFairScheduler::remove_entity_load_avg(&se);
+        }
+
+        // 通知 rseq CPU 迁移（仅非首次设置）
+        if old_cpu != ProcessorId::INVALID {
+            crate::process::rseq::Rseq::on_migrate(pcb);
+        }
     }
 
     // 先更新 cpu 字段，再更新 cfs_rq。on_cpu 由 prepare_task() 在 context_switch 前设置
