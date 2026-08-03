@@ -1,17 +1,22 @@
-use crate::arch::CurrentIrqArch;
-use crate::exception::InterruptArch;
-use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::open::{do_open_execat, do_open_execat_with_flags};
-use crate::libs::rwsem::RwSem;
-use crate::process::exec::{
-    load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
-    ExecStartInfo, LoadBinaryResult,
+use crate::{
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentIrqArch},
+    exception::InterruptArch,
+    filesystem::vfs::{
+        fcntl::AtFlags,
+        open::{do_open_execat, do_open_execat_with_flags},
+    },
+    libs::{rand::rand_bytes, rwsem::RwSem},
+    mm::ucontext::AddressSpace,
+    process::{
+        exec::{
+            load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
+            ExecStartInfo, LoadBinaryResult,
+        },
+        pid::PidType,
+        ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
+    },
+    syscall::Syscall,
 };
-use crate::process::{ProcessControlBlock, ProcessManager};
-use crate::syscall::Syscall;
-use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
-
-use crate::arch::interrupt::TrapFrame;
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -128,7 +133,19 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
-    // 尝试加载二进制文件
+    let pre_exec_pcb = ProcessManager::current_pcb();
+    let old_vpid = if !pre_exec_pcb.is_traced() {
+        0
+    } else {
+        ptrace::ptracer_of(&pre_exec_pcb)
+            .and_then(|tracer| {
+                pre_exec_pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns()))
+            })
+            .map(|p| p.data())
+            .unwrap_or(0)
+    };
+
+    // 尝试加载二进制文件（内部 begin_new_exec → de_thread 会交换 PID）
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
     match load_result {
@@ -154,6 +171,27 @@ fn do_execve_internal(
             address_space.write().user_stack = Some(ustack_message);
 
             let pcb = ProcessManager::current_pcb();
+
+            // ptrace EVENT_EXEC：old_vpid 已在 load_binary 之前保存（见函数前部）。
+            // TRACEEXEC 开启则 ptrace_notify；否则传统 attach（!SEIZED）发裸 SIGTRAP（SI_KERNEL）
+            if pcb.ptrace_event_enabled(ptrace::PtraceEvent::Exec) {
+                pcb.ptrace_event(ptrace::PtraceEvent::Exec, old_vpid);
+            } else if pcb.is_traced() && !pcb.flags().contains(ProcessFlags::PT_SEIZED) {
+                let mut info = crate::ipc::signal_types::SigInfo::new(
+                    Signal::SIGTRAP,
+                    0,
+                    crate::ipc::signal_types::SigCode::Kernel,
+                    crate::ipc::signal_types::SigType::Kill {
+                        pid: RawPid(0),
+                        uid: 0,
+                    },
+                );
+                let _ = Signal::SIGTRAP.send_signal_info_to_pcb(
+                    Some(&mut info),
+                    pcb.clone(),
+                    PidType::PID,
+                );
+            }
 
             // unshare fd_table if it's shared (CLONE_FILES case)
             // 参考 Linux: https://elixir.bootlin.com/linux/v6.1.9/source/fs/exec.c#L1857

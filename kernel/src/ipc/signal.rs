@@ -677,10 +677,10 @@ impl Signal {
         }
         drop(sig_info);
 
-        // TODO: ptrace 拦截被忽略的信号
-        // if pcb.flags().contains(ProcessFlags::PTRACED) && *self != Signal::SIGKILL {
-        //     return false;
-        // }
+        // 对被 ptrace 跟踪的任务，任何非 SIGKILL 信号都不视为 ignored —— tracer 必须能观察到所有信号
+        if pcb.flags().contains(ProcessFlags::PTRACED) && *self != Signal::SIGKILL {
+            return false;
+        }
 
         Self::sig_task_ignored(self, pcb, force)
     }
@@ -724,9 +724,16 @@ impl Signal {
                 t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
                 true
             });
-            // Serialize the scheduler stop with the persistent job-control
-            // state. This follows Linux's sighand -> pi_lock -> rq_lock order
-            // and prevents a concurrent SIGCONT from splitting the transition.
+            // 被 ptrace 跟踪的 tracee，stop 信号不在发送侧急切 group-stop，
+            // 而是入队让投递侧的 ptrace_signal 转为 signal-delivery-stop
+            // 否则 tracee 进入 group-stop（非 ptrace-stop），PTRACE_CONT 会 ESRCH。
+            // PTRACED 是每线程位，须检查信号目标 pcb 而非线程组长。
+            if pcb.flags().contains(ProcessFlags::PTRACED) {
+                return !self.sig_ignored(&pcb, false);
+            }
+            // 非 traced：事务化 group-stop（持 sighand 锁原子设置
+            // STOP_STOPPED | CLD_STOPPED + stop_signal），对齐 Linux 的
+            // sighand -> pi_lock -> rq_lock 序，防止并发 SIGCONT 撕裂。
             let fresh_stop = thread_group_leader
                 .sighand()
                 .transition_group_stop(*self, || {
@@ -784,7 +791,10 @@ impl Signal {
             // group stop produces a continued event.
             let was_stopped = thread_group_leader.sighand().transition_group_continue(|| {
                 ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                    let _ = ProcessManager::wakeup_stop(&t);
+                    // 非 seized 线程直接唤醒；seized 线程的唤醒交给 ptrace_trap_notify
+                    if !t.flags().contains(ProcessFlags::PT_SEIZED) {
+                        let _ = ProcessManager::wakeup_stop(&t);
+                    }
                     true
                 });
             });
@@ -801,6 +811,14 @@ impl Signal {
                     true
                 });
             }
+
+            // seized tracee 收到 SIGCONT 时，须离开 group-stop/LISTEN 并重陷 PTRACE_EVENT_STOP
+            ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
+                if t.flags().contains(ProcessFlags::PT_SEIZED) {
+                    t.ptrace_trap_notify();
+                }
+                true
+            });
             // 如果未处于 stopped，则不生成 CLD_CONTINUED/不通知父进程。
             // SIGCONT 需要完成“继续运行”的语义，但若其在当前 handler 语义下会被忽略（默认忽略且未被阻塞），
             // 则不应继续入队为 pending，否则可能错误地打断可重启系统调用。
@@ -865,15 +883,20 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
         // );
         ProcessManager::kick(&pcb);
     } else if fatal {
-        // log::debug!(
-        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> wakeup+kick",
-        //     pcb.raw_pid(),
-        //     state,
-        //     fatal
-        // );
-        let _r = ProcessManager::wakeup(&pcb).map(|_| {
+        // SIGKILL：必须能唤醒任何 killable 阻塞态。
+        {
+            let mut ps = pcb.ptrace_state.lock_irqsave();
+            ps.in_ptrace_stop = false;
+        }
+        let r = if pcb.sched_info().state().is_stopped() {
+            ProcessManager::wakeup_stop(&pcb)
+        } else {
+            ProcessManager::wakeup(&pcb)
+        };
+        // wakeup 失败（目标不在可唤醒阻塞态）才 kick；成功时 wakeup 已让目标重新调度，kick 冗余（修双 IPI）。
+        if r.is_err() {
             ProcessManager::kick(&pcb);
-        });
+        }
     } else if !state.is_stopped() {
         // log::debug!(
         //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick only",
@@ -1117,7 +1140,7 @@ pub fn set_user_sigmask(new_set: &mut SigSet) {
     let oset = *guard.sig_blocked();
 
     let flags = pcb.flags();
-    flags.set(ProcessFlags::RESTORE_SIG_MASK, true);
+    flags.insert(ProcessFlags::RESTORE_SIG_MASK);
 
     let saved_sigmask = guard.saved_sigmask_mut();
     *saved_sigmask = oset;
